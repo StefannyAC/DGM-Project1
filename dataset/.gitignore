@@ -1,0 +1,8 @@
+secrets
+*.venv
+notebooks
+__pycache__
+.ipynb_checkpoints/
+lakh-midi-clean
+lmd_matched
+lmd_matched_h5
