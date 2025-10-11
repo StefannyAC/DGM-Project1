@@ -1,0 +1,6 @@
+secrets
+*.venv
+notebooks
+data
+!data/*.csv
+__pycache__
