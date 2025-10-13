@@ -32,7 +32,7 @@ def midi_to_piano_roll(midi_path: Path, fs: int = 16) -> Optional[np.ndarray]:
     try:
         midi_data = pretty_midi.PrettyMIDI(str(midi_path))
         piano_roll = midi_data.get_piano_roll(fs=fs)
-        return (piano_roll > 0).astype(np.float32)
+        return (piano_roll > 0).astype(np.uint8)
     except Exception as e:
         logging.warning(f"No se pudo procesar {midi_path}: {e}")
         return None
@@ -206,6 +206,7 @@ class MIDIDataset(Dataset):
             # troceo no solapado; si quieres overlap usa step < seq_len
             for i in range(0, T - self.seq_len + 1, self.seq_len):
                 seq = piano_roll[:, i:i + self.seq_len]
+                seq = pack_matrix(seq)
                 self.sequences.append(seq)
 
                 if events is not None:
@@ -238,8 +239,27 @@ class MIDIDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = torch.from_numpy(self.sequences[idx])          # (128, T)
+        seq_packed = self.sequences[idx]
+        seq = torch.from_numpy(unpack_matrix(seq_packed))          # (128, T)
+        
         events = torch.from_numpy(self.event_encodings[idx]) # (N, 3)
         genre_id = int(self.labels[idx])
         cond_vec = torch.tensor([genre_id], dtype=torch.long)
         return {"piano_roll": seq, "events": events, "conditions": cond_vec}
+
+
+def pack_matrix(matrix: np.ndarray) -> bytes:
+    """
+    Pack a 128x128 binary numpy array into 2048 bytes (bit-packed).
+    """
+    # Flatten and pack bits into bytes
+    packed = np.packbits(matrix.flatten())
+    return packed.tobytes()  # 128*128 bits / 8 = 2048 bytes
+
+
+def unpack_matrix(data: bytes) -> np.ndarray:
+    """
+    Unpack 2048 bytes back into a 128x128 binary numpy array.
+    """
+    unpacked = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+    return unpacked.reshape((128, 128))
