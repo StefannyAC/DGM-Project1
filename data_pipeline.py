@@ -11,6 +11,7 @@ import random
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -178,11 +179,12 @@ class MIDIDataset(Dataset):
 
         # cache separado por modo de labels
         cache_suffix = "csv" if self.label_mode == "csv" else self.label_mode
-        cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}.npz"
+        cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}.pkl"
 
         if self.cache and cache_path.exists():
             logging.info(f"Cargando cache desde {cache_path}")
-            data = np.load(cache_path, allow_pickle=True)
+            with open(cache_path, 'rb') as handle:
+                data = pickle.load(handle)
             self.sequences = list(data["sequences"])
             self.event_encodings = list(data["event_encodings"])
             self.labels = list(data["labels"])
@@ -193,7 +195,7 @@ class MIDIDataset(Dataset):
         if not file_label_pairs:
             raise ValueError("No hay archivos MIDI etiquetados para procesar.")
 
-        for midi_path, genre_id in tqdm(file_label_pairs, desc="Procesando archivos MIDI"):
+        for midi_path, genre_id in tqdm(file_label_pairs[:100], desc="Procesando archivos MIDI"):
             piano_roll = midi_to_piano_roll(midi_path, self.fs)
             if piano_roll is None or piano_roll.shape[1] < self.seq_len:
                 continue
@@ -220,12 +222,13 @@ class MIDIDataset(Dataset):
             raise RuntimeError("No se generaron secuencias. Revisa rutas/CSV y parámetros.")
 
         if self.cache:
-            np.savez_compressed(
-                cache_path,
-                sequences=self.sequences,
-                event_encodings=self.event_encodings,
-                labels=self.labels
-            )
+            data_to_cache = {
+                'sequences': self.sequences,
+                'event_encodings': self.event_encodings,
+                'labels': self.labels
+            }
+            with open(cache_path, 'wb') as handle:
+                pickle.dump(data_to_cache, handle, protocol=pickle.HIGHEST_PROTOCOL)
             logging.info(f"Cache guardado en {cache_path}")
 
         logging.info(f"Total de secuencias: {len(self.sequences)}")
