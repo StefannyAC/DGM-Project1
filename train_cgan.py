@@ -8,13 +8,13 @@
 # ============================================================
 
 import torch
-from torch.utils.data import DataLoader
 import logging
 from tqdm import tqdm
 from pathlib import Path
-from data_pipeline import MIDIDataset
+
+from data_pipeline import build_loader
 from cgan import Generator, Critic, compute_gradient_penalty    
-from cvae import CVAE                    
+from cvae import CVAE         
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -63,13 +63,25 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
         opt_g.step()
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     seq_len = 128
-    batch_size = 16
+    batch_size = 128
 
     # Dataset (sin curriculum en Stage-2)
-    dataset = MIDIDataset("datasets/LPD-Cleansed", seq_len=seq_len)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
+    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
+    dataloader = build_loader(
+        midi_root=midi_root,
+        csv_path=csv_path,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        use_balanced_sampler=True,
+    )
 
     # Modelos
     cvae = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
@@ -94,7 +106,7 @@ def main():
     }
 
     # Entrenamiento
-    total_epochs = 100
+    total_epochs = 1
     for epoch in range(total_epochs):
         logging.info(f"=== Epoch {epoch}/{total_epochs-1} (Stage-2) ===")
         train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)

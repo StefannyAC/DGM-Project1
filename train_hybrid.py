@@ -1,11 +1,11 @@
 # train_hybrid.py
 
 import torch
-from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import logging
 from tqdm import tqdm
-from data_pipeline import MIDIDataset
+
+from data_pipeline import build_loader
 from cvae import CVAE
 from cgan import Generator, Critic, compute_gradient_penalty
 
@@ -33,7 +33,8 @@ def train_hybrid_epoch(cvae, generator, critic, dataloader, optimizers, device, 
         # --- Critic ---
         for _ in range(config["critic_iters"]):
             opt_c.zero_grad()
-            z, _, _ = cvae.encoder(piano_roll, events, cond)
+            mu, logvar= cvae.encoder(piano_roll, events, cond)
+            z = cvae.reparameterize(mu,logvar)
             fake = generator(z, cond)
             real_out = critic(piano_roll, cond)
             fake_out = critic(fake.detach(), cond)
@@ -47,7 +48,8 @@ def train_hybrid_epoch(cvae, generator, critic, dataloader, optimizers, device, 
         recon_loss = F.mse_loss(reconstructed, piano_roll, reduction='sum')
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         loss_cvae = recon_loss + config["beta"] * kl_loss
-        z, _, _ = cvae.encoder(piano_roll, events, cond)
+        mu, logvar= cvae.encoder(piano_roll, events, cond)
+        z = cvae.reparameterize(mu,logvar)
         fake = generator(z, cond)
         fake_out = critic(fake, cond)
         loss_g = -torch.mean(fake_out)
@@ -56,14 +58,29 @@ def train_hybrid_epoch(cvae, generator, critic, dataloader, optimizers, device, 
         opt_g.step(); opt_cvae.step()
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dataset = MIDIDataset("datasets/LPD-Cleansed", seq_len=128)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=0)
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+
+    batch_size = 64
+    seq_len = 128
+    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
+    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
+    dataloader = build_loader(
+        midi_root=midi_root,
+        csv_path=csv_path,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        use_balanced_sampler=True,
+    )
 
     # Cargar modelos preentrenados
-    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=128).to(device)
-    generator = Generator(z_dim=128, cond_dim=4, seq_len=128).to(device)
-    critic = Critic(cond_dim=4, seq_len=128).to(device)
+    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
+    generator = Generator(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
+    critic = Critic(cond_dim=4, seq_len=seq_len).to(device)
     cvae.load_state_dict(torch.load("checkpoints/cvae_pretrained.pth"))
     generator.load_state_dict(torch.load("checkpoints/generator_pretrained.pth"))
     critic.load_state_dict(torch.load("checkpoints/critic_pretrained.pth"))
@@ -72,7 +89,7 @@ def main():
     opt_g = torch.optim.Adam(generator.parameters(), lr=1e-5, betas=(0.5, 0.999))
     opt_c = torch.optim.Adam(critic.parameters(), lr=1e-5, betas=(0.5, 0.999))
 
-    config = {"alpha":1.0, "beta":1.0, "gamma":0.5, "lambda_gp":10, "critic_iters":5, "total_epochs": 200,"batch_size": 16,"curriculum": {0: 32, 50: 64, 100: 128}}
+    config = {"alpha":1.0, "beta":1.0, "gamma":0.5, "lambda_gp":10, "critic_iters":5, "total_epochs": 6,"batch_size": 16,"curriculum": {0: 32, 2: 64, 4: 128}}
 
     current_seq_len = -1
     for epoch in range(config["total_epochs"]):
@@ -81,8 +98,13 @@ def main():
             current_seq_len = new_seq_len
             logging.info(f"[Curriculum] Epoch {epoch}: secuencia = {current_seq_len}")
 
-            dataset = MIDIDataset("datasets/LPD-Cleansed", seq_len=current_seq_len)
-            dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
+            dataloader = build_loader(
+                midi_root=midi_root,
+                csv_path=csv_path,
+                seq_len=current_seq_len,
+                batch_size=batch_size,
+                use_balanced_sampler=True
+            )
 
         train_hybrid_epoch(cvae, generator, critic, dataloader,
                         (opt_cvae, opt_g, opt_c), device, config)

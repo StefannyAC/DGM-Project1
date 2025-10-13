@@ -12,13 +12,16 @@ import logging
 from pathlib import Path
 from typing import List, Tuple, Optional
 import pickle
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 import pretty_midi
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from tqdm import tqdm
+
+from utils_collate import collate_padded
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -195,7 +198,7 @@ class MIDIDataset(Dataset):
         if not file_label_pairs:
             raise ValueError("No hay archivos MIDI etiquetados para procesar.")
 
-        for midi_path, genre_id in tqdm(file_label_pairs, desc="Procesando archivos MIDI"):
+        for midi_path, genre_id in tqdm(file_label_pairs[:1000], desc="Procesando archivos MIDI"):
             piano_roll = midi_to_piano_roll(midi_path, self.fs)
             if piano_roll is None or piano_roll.shape[1] < self.seq_len:
                 continue
@@ -240,7 +243,7 @@ class MIDIDataset(Dataset):
 
     def __getitem__(self, idx):
         seq_packed = self.sequences[idx]
-        seq = torch.from_numpy(unpack_matrix(seq_packed))          # (128, T)
+        seq = torch.from_numpy(unpack_matrix(seq_packed, (128, self.seq_len)))          # (128, T)
         
         events = torch.from_numpy(self.event_encodings[idx]) # (N, 3)
         genre_id = int(self.labels[idx])
@@ -257,9 +260,51 @@ def pack_matrix(matrix: np.ndarray) -> bytes:
     return packed.tobytes()  # 128*128 bits / 8 = 2048 bytes
 
 
-def unpack_matrix(data: bytes) -> np.ndarray:
+def unpack_matrix(data: bytes, shape: tuple = (128, 128)) -> np.ndarray:
     """
     Unpack 2048 bytes back into a 128x128 binary numpy array.
     """
     unpacked = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-    return unpacked.reshape((128, 128))
+    return unpacked.reshape(shape)
+
+
+def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
+                 use_balanced_sampler=True):
+    dataset = MIDIDataset(
+        midi_root=midi_root,
+        seq_len=seq_len,
+        fs=16,
+        cache=True,
+        label_mode="csv",
+        csv_path=csv_path,
+        csv_path_column="path",
+        csv_label_column="genre_id",
+    )
+
+    if use_balanced_sampler:
+        counts = Counter(dataset.labels)  # ids 0..3
+        # inversa de frecuencia por clase
+        class_weight = {c: 1.0 / max(n, 1) for c, n in counts.items()}
+        sample_w = [class_weight[y] for y in dataset.labels]
+        sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_padded,
+        )
+        logging.info(f"Sampler balanceado activo. Distribución: {dict(counts)}")
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_padded,
+        )
+    return loader

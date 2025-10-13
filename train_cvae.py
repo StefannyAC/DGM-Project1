@@ -1,57 +1,14 @@
 # train_cvae.py
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
 import logging
 from tqdm import tqdm
-from collections import Counter
 
-from data_pipeline import MIDIDataset
+from data_pipeline import build_loader
 from cvae import CVAE
-from utils_collate import collate_padded
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
-                 use_balanced_sampler=True):
-    dataset = MIDIDataset(
-        midi_root=midi_root,
-        seq_len=seq_len,
-        fs=16,
-        cache=True,
-        label_mode="csv",
-        csv_path=csv_path,
-        csv_path_column="path",
-        csv_label_column="genre_id",
-    )
-
-    if use_balanced_sampler:
-        counts = Counter(dataset.labels)  # ids 0..3
-        # inversa de frecuencia por clase
-        class_weight = {c: 1.0 / max(n, 1) for c, n in counts.items()}
-        sample_w = [class_weight[y] for y in dataset.labels]
-        sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=collate_padded,
-        )
-        logging.info(f"Sampler balanceado activo. Distribución: {dict(counts)}")
-    else:
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=collate_padded,
-        )
-    return loader
 
 def train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=None):
     model.train()
@@ -96,12 +53,17 @@ def train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weigh
     )
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     print(f"\nUsing Device: {device}\n")
     midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
     csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
     seq_len   = 128
-    batch_size = 16
+    batch_size = 64
     num_workers = 0  # Windows -> 0
 
     # loader (balanceado por defecto)
@@ -125,7 +87,7 @@ def main():
     model = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    epochs = 100
+    epochs = 10
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch+1}/{epochs}")
         train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=w_vec)
