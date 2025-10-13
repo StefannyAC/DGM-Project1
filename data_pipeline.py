@@ -1,23 +1,30 @@
 # data_pipeline.py
+# ============================================================
+# Dataset MIDI para CVAE + cGAN condicionado por género
+# - SOLO usa etiquetas desde CSV (path, genre_id)
+# - Extrae piano-roll y eventos; trocea por seq_len; soporta cache
+# ============================================================
 
-import torch
-import numpy as np
-import pretty_midi
-from torch.utils.data import Dataset
-from pathlib import Path
-from tqdm import tqdm
-import logging
-import random
+import os
 import json
+import random
+import logging
+from pathlib import Path
+from typing import List, Tuple, Optional
 
-# Configuración básica de logging
+import numpy as np
+import pandas as pd
+import pretty_midi
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-# ------------------------------------------------------------
-# Función: Convertir MIDI a piano-roll binario
-# ------------------------------------------------------------
-def midi_to_piano_roll(midi_path: Path, fs: int = 16) -> np.ndarray | None:
+# -------------------------------
+# Utilidades de conversión
+# -------------------------------
+def midi_to_piano_roll(midi_path: Path, fs: int = 16) -> Optional[np.ndarray]:
     """
     Convierte un archivo MIDI en una matriz piano-roll binaria (128 x T).
     """
@@ -29,11 +36,7 @@ def midi_to_piano_roll(midi_path: Path, fs: int = 16) -> np.ndarray | None:
         logging.warning(f"No se pudo procesar {midi_path}: {e}")
         return None
 
-
-# ------------------------------------------------------------
-# Función: Convertir MIDI a codificación basada en eventos
-# ------------------------------------------------------------
-def midi_to_event_encoding(midi_path: Path) -> np.ndarray | None:
+def midi_to_event_encoding(midi_path: Path) -> Optional[np.ndarray]:
     """
     Extrae eventos (timestamp, pitch, velocity) de un archivo MIDI.
     """
@@ -43,113 +46,178 @@ def midi_to_event_encoding(midi_path: Path) -> np.ndarray | None:
         for instrument in midi_data.instruments:
             for note in instrument.notes:
                 events.append((note.start, note.pitch, note.velocity))
-        events.sort(key=lambda x: x[0])  # ordenar por tiempo
+        events.sort(key=lambda x: x[0])
         return np.array(events, dtype=np.float32)
     except Exception as e:
         logging.warning(f"No se pudo procesar eventos de {midi_path}: {e}")
         return None
 
+# -------------------------------
+# Normalización de rutas (CSV)
+# -------------------------------
+def normalize_csv_path(path_str: str, root_dir: Path) -> Path:
+    """
+    Normaliza la ruta venida del CSV y la rehace relativa a root_dir.
+    - Convierte separadores \ ↔ /.
+    - Recorta './' inicial.
+    - Si es absoluta, intenta relativizarla a root_dir; si no se puede, la usa tal cual.
+    """
+    s = (path_str or '').strip().replace('\\', '/')
+    s = s.lstrip('./')
+    p = Path(s)
+    if p.is_absolute():
+        try:
+            rel = p.relative_to(root_dir)
+            return root_dir / rel
+        except Exception:
+            return p
+    return root_dir / p
 
-# ------------------------------------------------------------
-# Clase: MIDIDataset (CVAE + cGAN condicionado por género)
-# ------------------------------------------------------------
+# ============================================================
+# Dataset
+# ============================================================
 class MIDIDataset(Dataset):
     """
-    Dataset extendido para CVAE + cGAN:
-    - Genera piano-roll y codificación por eventos.
-    - Condiciona únicamente por género musical.
-    - Compatible con Lakh Pianoroll Dataset (LPD-Cleansed) u otros datasets organizados por carpeta de género.
-    - Soporta curriculum learning (longitudes variables).
+    Dataset para CVAE + cGAN:
+      - Construye secuencias (piano-roll) y eventos por ventana de seq_len.
+      - Etiqueta por género (0..3) desde CSV.
+      - Cache opcional.
     """
 
     def __init__(
         self,
-        midi_dir: str,
+        midi_root: str,                    # raíz donde viven los .mid
         seq_len: int,
         fs: int = 16,
         cache: bool = True,
-        label_mode: str = "folder"  # "folder" o "synthetic"
+        label_mode: str = "csv",           # "csv" 
+        csv_path: Optional[str] = None,    # requerido si label_mode="csv"
+        csv_path_column: str = "path",
+        csv_label_column: str = "genre_id",
     ):
         """
         Args:
-            midi_dir (str): Carpeta raíz con subcarpetas de géneros (ej. classical/, jazz/, rock/, pop/).
-            seq_len (int): Longitud de las secuencias temporales.
-            fs (int): Frecuencia de muestreo (time steps por segundo).
-            cache (bool): Guardar resultados preprocesados en .npz.
-            label_mode (str): "folder" usa el nombre de la carpeta como género; "synthetic" genera aleatorio.
+            midi_root: carpeta raíz del dataset MIDI ('data/Lakh_MIDI_Dataset_Clean')
+            seq_len: longitud temporal por muestra
+            fs: frames por segundo para piano-roll
+            cache: guardar/leer cache .npz
+            label_mode:
+                - "csv": usa CSV para (path -> genre_id)
+                - "synthetic": adjunta géneros aleatorios (debug)
+            csv_path: ruta al CSV (si label_mode="csv")
+            csv_path_column: nombre de columna con la ruta del MIDI
+            csv_label_column: nombre de columna con el genre_id (0..3)
         """
-        self.midi_path = Path(midi_dir)
+        self.midi_root = Path(midi_root)
         self.seq_len = seq_len
         self.fs = fs
         self.cache = cache
         self.label_mode = label_mode
-        self.sequences = []
-        self.event_encodings = []
-        self.labels = []
+        self.csv_path = Path(csv_path) if csv_path else None
+        self.csv_path_column = csv_path_column
+        self.csv_label_column = csv_label_column
 
-        if not self.midi_path.is_dir():
-            raise FileNotFoundError(f"Directorio no encontrado: {midi_dir}")
+        if not self.midi_root.is_dir():
+            raise FileNotFoundError(f"Raíz MIDI no encontrada: {midi_root}")
 
-        # Mapear géneros conocidos a IDs
-        self.genre_map = {
-            "classical": 0,
-            "jazz": 1,
-            "rock": 2,
-            "pop": 3,
-            "electronic": 4
-        }
+        if self.label_mode == "csv" and (self.csv_path is None or not self.csv_path.is_file()):
+            raise FileNotFoundError("label_mode='csv' requiere csv_path válido con columnas 'path' y 'genre_id'.")
+
+        self.sequences: List[np.ndarray] = []
+        self.event_encodings: List[np.ndarray] = []
+        self.labels: List[int] = []
 
         self._prepare_data()
 
-    # --------------------------------------------------------
+    # -------------------------------
+    def _load_csv_index(self) -> List[Tuple[Path, int]]:
+        """
+        Lee el CSV y retorna lista de (ruta_normalizada, genre_id).
+        """
+        df = pd.read_csv(self.csv_path)
+        if self.csv_path_column not in df.columns or self.csv_label_column not in df.columns:
+            raise ValueError(f"CSV debe incluir columnas '{self.csv_path_column}' y '{self.csv_label_column}'.")
+
+        pairs: List[Tuple[Path, int]] = []
+        missing = 0
+        for _, row in df.iterrows():
+            rel = str(row[self.csv_path_column])
+            gid = int(row[self.csv_label_column])
+            midi_path = normalize_csv_path(rel, self.midi_root)
+            if not midi_path.is_file():
+                missing += 1
+                continue
+            # Acepta .mid o .midi
+            if midi_path.suffix.lower() not in (".mid", ".midi"):
+                continue
+            pairs.append((midi_path, gid))
+
+        if missing > 0:
+            logging.warning(f"[CSV] {missing} rutas del CSV no se encontraron bajo {self.midi_root}. Se omiten.")
+
+        logging.info(f"[CSV] Cargados {len(pairs)} archivos validados desde {self.csv_path}.")
+        return pairs
+
+    # -------------------------------
+    def _iter_files_and_labels(self) -> List[Tuple[Path, int]]:
+        """
+        Retorna la lista de (ruta_midi, genre_id) según label_mode.
+        """
+        if self.label_mode == "csv":
+            return self._load_csv_index()
+
+        # synthetic (debug): escanea raíz y asigna etiqueta aleatoria
+        midi_paths = list(self.midi_root.rglob("*.mid")) + list(self.midi_root.rglob("*.midi"))
+        pairs = [(p, random.randint(0, 3)) for p in midi_paths]
+        logging.info(f"[SYNTHETIC] Etiquetas aleatorias para {len(pairs)} archivos.")
+        return pairs
+
+    # -------------------------------
     def _prepare_data(self):
-        """
-        Convierte los archivos MIDI en secuencias de longitud fija,
-        y genera representaciones duales (piano-roll y eventos).
-        """
-        logging.info(f"Preparando datos con secuencia de longitud {self.seq_len}...")
+        logging.info(f"Preparando datos: seq_len={self.seq_len}, fs={self.fs}, label_mode={self.label_mode}")
 
-        all_midi_files = list(self.midi_path.glob("**/*.mid")) + list(self.midi_path.glob("**/*.midi"))
-        if not all_midi_files:
-            raise ValueError(f"No se encontraron archivos MIDI en {self.midi_path}")
+        # cache separado por modo de labels
+        cache_suffix = "csv" if self.label_mode == "csv" else self.label_mode
+        cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}.npz"
 
-        cache_path = self.midi_path / f"cache_seq{self.seq_len}_genre.npz" 
         if self.cache and cache_path.exists():
-            logging.info(f"Cargando dataset cacheado desde {cache_path}")
-            cache_data = np.load(cache_path, allow_pickle=True)
-            self.sequences = list(cache_data["sequences"])
-            self.event_encodings = list(cache_data["event_encodings"])
-            self.labels = list(cache_data["labels"])
+            logging.info(f"Cargando cache desde {cache_path}")
+            data = np.load(cache_path, allow_pickle=True)
+            self.sequences = list(data["sequences"])
+            self.event_encodings = list(data["event_encodings"])
+            self.labels = list(data["labels"])
+            logging.info(f"Dataset cacheado: {len(self.sequences)} secuencias.")
             return
 
-        for midi_file in tqdm(all_midi_files, desc="Procesando archivos MIDI"):
-            piano_roll = midi_to_piano_roll(midi_file, self.fs)
-            events = midi_to_event_encoding(midi_file)
+        file_label_pairs = self._iter_files_and_labels()
+        if not file_label_pairs:
+            raise ValueError("No hay archivos MIDI etiquetados para procesar.")
 
-            if piano_roll is None or piano_roll.shape[1] < 2:
+        for midi_path, genre_id in tqdm(file_label_pairs, desc="Procesando archivos MIDI"):
+            piano_roll = midi_to_piano_roll(midi_path, self.fs)
+            if piano_roll is None or piano_roll.shape[1] < self.seq_len:
                 continue
 
-            genre_id = self._get_genre_label(midi_file)
+            events = midi_to_event_encoding(midi_path)
 
-            # Dividir en fragmentos de seq_len
-            total_timesteps = piano_roll.shape[1]
-            for i in range(0, total_timesteps - self.seq_len + 1, self.seq_len):
+            T = piano_roll.shape[1]
+            # troceo no solapado; si quieres overlap usa step < seq_len
+            for i in range(0, T - self.seq_len + 1, self.seq_len):
                 seq = piano_roll[:, i:i + self.seq_len]
                 self.sequences.append(seq)
 
-                # Generar codificación por eventos correspondiente (simplificada)
                 if events is not None:
-                    mask = (events[:, 0] >= i / self.fs) & (events[:, 0] < (i + self.seq_len) / self.fs)
-                    segment_events = events[mask]
-                    self.event_encodings.append(segment_events)
+                    t0, t1 = i / self.fs, (i + self.seq_len) / self.fs
+                    mask = (events[:, 0] >= t0) & (events[:, 0] < t1)
+                    seg_events = events[mask]
+                    self.event_encodings.append(seg_events)
                 else:
                     self.event_encodings.append(np.zeros((0, 3), dtype=np.float32))
 
-                # Etiqueta de género
-                self.labels.append(genre_id)
+                self.labels.append(int(genre_id))
 
         if not self.sequences:
-            raise RuntimeError("No se pudo generar ninguna secuencia válida.")
+            raise RuntimeError("No se generaron secuencias. Revisa rutas/CSV y parámetros.")
 
         if self.cache:
             np.savez_compressed(
@@ -158,36 +226,17 @@ class MIDIDataset(Dataset):
                 event_encodings=self.event_encodings,
                 labels=self.labels
             )
-            logging.info(f"Dataset cacheado en {cache_path}")
+            logging.info(f"Cache guardado en {cache_path}")
 
-        logging.info(f"Total de secuencias generadas: {len(self.sequences)}")
+        logging.info(f"Total de secuencias: {len(self.sequences)}")
 
-    # --------------------------------------------------------
-    def _get_genre_label(self, midi_file: Path) -> int:
-        """
-        Obtiene el género según la carpeta (modo 'folder') o genera aleatoriamente (modo 'synthetic').
-        """
-        if self.label_mode == "folder":
-            parent = midi_file.parent.name.lower()
-            for genre, gid in self.genre_map.items():
-                if genre in parent:
-                    return gid
-            return random.randint(0, len(self.genre_map) - 1)
-        else:
-            return random.randint(0, len(self.genre_map) - 1)
-
-    # --------------------------------------------------------
+    # -------------------------------
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = torch.from_numpy(self.sequences[idx])  # (128, T)
-        events = torch.from_numpy(self.event_encodings[idx])  # (N, 3)
-        genre_id = self.labels[idx]
-
-        cond_vec = torch.tensor([genre_id], dtype=torch.long)  # solo género
-        return {
-            "piano_roll": seq,
-            "events": events,
-            "conditions": cond_vec
-        }
+        seq = torch.from_numpy(self.sequences[idx])          # (128, T)
+        events = torch.from_numpy(self.event_encodings[idx]) # (N, 3)
+        genre_id = int(self.labels[idx])
+        cond_vec = torch.tensor([genre_id], dtype=torch.long)
+        return {"piano_roll": seq, "events": events, "conditions": cond_vec}

@@ -1,56 +1,139 @@
-#train_cvae.py
-
+# train_cvae.py
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
 import logging
 from tqdm import tqdm
+from collections import Counter
+
 from data_pipeline import MIDIDataset
 from cvae import CVAE
 from utils_collate import collate_padded
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0):
+def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
+                 use_balanced_sampler=True):
+    dataset = MIDIDataset(
+        midi_root=midi_root,
+        seq_len=seq_len,
+        fs=16,
+        cache=True,
+        label_mode="csv",
+        csv_path=csv_path,
+        csv_path_column="path",
+        csv_label_column="genre_id",
+    )
+
+    if use_balanced_sampler:
+        counts = Counter(dataset.labels)  # ids 0..3
+        # inversa de frecuencia por clase
+        class_weight = {c: 1.0 / max(n, 1) for c, n in counts.items()}
+        sample_w = [class_weight[y] for y in dataset.labels]
+        sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_padded,
+        )
+        logging.info(f"Sampler balanceado activo. Distribución: {dict(counts)}")
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_padded,
+        )
+    return loader
+
+def train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=None):
     model.train()
-    total_recon, total_kl = 0, 0
+    total_recon, total_kl, total_samples = 0.0, 0.0, 0
+
     for batch in tqdm(dataloader, desc="Entrenando CVAE"):
-        piano_roll = batch["piano_roll"].to(device)
-        events = batch["events"].to(device)
-        cond = batch["conditions"].to(device)
+        X = batch["piano_roll"].to(device).float()   # (B,128,T) en [0,1]
+        E = batch["events"].to(device).float()       # (B,N,3)
+        y = batch["conditions"].to(device)           # (B,1) long
+        B = X.size(0)
 
         optimizer.zero_grad()
-        reconstructed, mu, logvar = model(piano_roll, events, cond)
+        X_rec, mu, logvar = model(X, E, y)
 
-        recon_loss = F.binary_cross_entropy(reconstructed, piano_roll, reduction='sum')
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        loss = recon_loss + beta * kl_loss
+        # --- pérdidas por muestra ---
+        # BCE por muestra
+        bce = F.binary_cross_entropy(X_rec, X, reduction='none')  # (B,128,T)
+        bce = bce.sum(dim=(1,2))  # (B,)
+
+        # KL por muestra
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)  # (B,)
+
+        if class_weights is not None:
+            # y: (B,1) -> (B,)
+            y_flat = y.squeeze(-1).long()
+            w = class_weights[y_flat]  # (B,)
+            loss = (w * (bce + beta * kl)).mean()
+        else:
+            loss = (bce + beta * kl).mean()
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # estabilidad
         optimizer.step()
-        total_recon += recon_loss.item()
-        total_kl += kl_loss.item()
 
-    logging.info(f"Recon: {total_recon/len(dataloader.dataset):.4f}, KL: {total_kl/len(dataloader.dataset):.4f}")
+        total_recon += bce.sum().item()
+        total_kl    += kl.sum().item()
+        total_samples += B
+
+    logging.info(
+        f"Recon/sample: {total_recon/total_samples:.2f} | "
+        f"KL/sample: {total_kl/total_samples:.2f}"
+    )
 
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dataset = MIDIDataset("datasets/LPD-Cleansed", seq_len=128)
-    dataloader = DataLoader(
-    dataset,
-    batch_size=16,
-    shuffle=True,
-    num_workers=0, 
-    collate_fn=collate_padded)
+    print(f"\nUsing Device: {device}\n")
+    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
+    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
+    seq_len   = 128
+    batch_size = 16
+    num_workers = 0  # Windows -> 0
 
-    model = CVAE(z_dim=128, cond_dim=4, seq_len=128).to(device)
+    # loader (balanceado por defecto)
+    dataloader = build_loader(
+        midi_root=midi_root,
+        csv_path=csv_path,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        use_balanced_sampler=True,
+    )
+
+    # pesos por clase para ELBO (inverso de frecuencia)
+    from collections import Counter
+    counts = Counter(dataloader.dataset.labels)
+    w_vec = torch.tensor(
+        [1.0 / max(counts.get(c, 1), 1) for c in range(4)],
+        dtype=torch.float32, device=device
+    )
+
+    model = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    for epoch in range(100):
-        train_cvae_epoch(model, dataloader, optimizer, device)
+    epochs = 100
+    for epoch in range(epochs):
+        logging.info(f"Epoch {epoch+1}/{epochs}")
+        train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=w_vec)
 
+    Path("checkpoints").mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/cvae_pretrained.pth")
-    logging.info("CVAE preentrenado guardado en checkpoints/")
+    logging.info("CVAE preentrenado guardado en checkpoints/cvae_pretrained.pth")
 
 if __name__ == "__main__":
+    from pathlib import Path
     main()
