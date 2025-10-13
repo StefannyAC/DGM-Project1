@@ -195,7 +195,7 @@ class MIDIDataset(Dataset):
         if not file_label_pairs:
             raise ValueError("No hay archivos MIDI etiquetados para procesar.")
 
-        for midi_path, genre_id in tqdm(file_label_pairs[:100], desc="Procesando archivos MIDI"):
+        for midi_path, genre_id in tqdm(file_label_pairs, desc="Procesando archivos MIDI"):
             piano_roll = midi_to_piano_roll(midi_path, self.fs)
             if piano_roll is None or piano_roll.shape[1] < self.seq_len:
                 continue
