@@ -2,3 +2,5 @@ torch
 torchvision
 tqdm
 pretty_midi
+pandas
+mido
