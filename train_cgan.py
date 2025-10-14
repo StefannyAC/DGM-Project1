@@ -69,7 +69,7 @@ def main():
         device = 'mps'
     else:
         device = 'cpu'
-    seq_len = 128
+    seq_len = 32
     batch_size = 128
 
     # Dataset (sin curriculum en Stage-2)

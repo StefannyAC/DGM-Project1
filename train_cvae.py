@@ -62,7 +62,7 @@ def main():
     print(f"\nUsing Device: {device}\n")
     midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
     csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
-    seq_len   = 128
+    seq_len   = 32
     batch_size = 64
     num_workers = 0  # Windows -> 0
 
@@ -87,7 +87,7 @@ def main():
     model = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    epochs = 10
+    epochs = 1
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch+1}/{epochs}")
         train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=w_vec)

@@ -137,7 +137,7 @@ def main():
     csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
 
     curriculum = [32, 64, 128]   # seq_len reales por etapa
-    epochs_per = [2, 2, 2]       # ajusta a gusto
+    epochs_per = [1, 1, 1]       # ajusta a gusto
 
     z_dim = 128
     cond_dim = 4
