@@ -25,8 +25,9 @@ def encode_with_cvae(cvae, X, E, y):
     z = cvae.reparameterize(mu, logvar)
     return z
 
-def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config):
+def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config, log_every=50):
     generator.train(); critic.train(); cvae.eval()  # CVAE congelada aquí
+    step = 0
 
     for batch in tqdm(dataloader, desc="Stage-2: Entrenando C-GAN acoplada a CVAE"):
         X  = batch["piano_roll"].to(device)     # (B, 128, T)
@@ -44,11 +45,16 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
 
             real_out = critic(X, y)
             fake_out = critic(X_fake, y)
-            gp = compute_gradient_penalty(lambda x: critic(x, y), X.data, X_fake.data, device)
+            gp = compute_gradient_penalty(lambda x: critic(x, y), X.detach(), X_fake.detach(), device)
 
             loss_c = -torch.mean(real_out) + torch.mean(fake_out) + config["lambda_gp"] * gp
             loss_c.backward()
             opt_c.step()
+
+            D_real = real_out.mean().item()
+            D_fake = fake_out.mean().item()
+            Wdist  = D_real - D_fake
+            GP = float(gp.item())
 
         # ------------- ENTRENAR GENERATOR ---------------
         opt_g.zero_grad()
@@ -60,6 +66,15 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
         loss_g = -torch.mean(fake_out)
         loss_g.backward()
         opt_g.step()
+
+        step += 1
+
+        # ---- imprimir cada N pasos y también en tqdm ----
+        if step % log_every == 0:
+            tqdm.write(
+                f"Step={step} | D_real={D_real:.3f} D_fake={D_fake:.3f} | "
+                f"W={Wdist:.3f} GP={GP:.3f} | loss_D={loss_c.item():.3f} loss_G={loss_g.item():.3f}"
+            )
 
 def main():
     if torch.cuda.is_available():
@@ -107,8 +122,8 @@ def main():
     # Entrenamiento
     total_epochs = 5
     for epoch in range(total_epochs):
-        logging.info(f"=== Epoch {epoch}/{total_epochs-1} (Stage-2) ===")
-        train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
+        logging.info(f"=== Epoch {epoch+1}/{total_epochs-1} (Stage-2) ===")
+        train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config, log_every=5)
 
     # Guardar
     Path("checkpoints").mkdir(exist_ok=True)
