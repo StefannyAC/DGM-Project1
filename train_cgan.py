@@ -25,7 +25,7 @@ def encode_with_cvae(cvae, X, E, y):
     z = cvae.reparameterize(mu, logvar)
     return z
 
-def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config, log_every=50):
+def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config, log_every=5):
     generator.train(); critic.train(); cvae.eval()  # CVAE congelada aquí
     step = 0
 
