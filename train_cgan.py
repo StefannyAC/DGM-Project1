@@ -69,7 +69,7 @@ def main():
     else:
         device = 'cpu'
     seq_len = 32
-    batch_size = 128
+    batch_size = 512
 
     # Dataset (sin curriculum en Stage-2)
     midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
@@ -105,7 +105,7 @@ def main():
     }
 
     # Entrenamiento
-    total_epochs = 1
+    total_epochs = 5
     for epoch in range(total_epochs):
         logging.info(f"=== Epoch {epoch}/{total_epochs-1} (Stage-2) ===")
         train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
