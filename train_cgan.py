@@ -27,7 +27,9 @@ def encode_with_cvae(cvae, X, E, y):
 
 def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config, log_every=5):
     generator.train(); critic.train(); cvae.eval()  # CVAE congelada aquí
-    step = 0
+    
+    tot_ld = tot_lg = tot_dreal = tot_dfake = tot_w = tot_gp = 0.0
+    steps = 0
 
     for batch in tqdm(dataloader, desc="Stage-2: Entrenando C-GAN acoplada a CVAE"):
         X  = batch["piano_roll"].to(device)     # (B, 128, T)
@@ -51,11 +53,6 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
             loss_c.backward()
             opt_c.step()
 
-            D_real = real_out.mean().item()
-            D_fake = fake_out.mean().item()
-            Wdist  = D_real - D_fake
-            GP = float(gp.item())
-
         # ------------- ENTRENAR GENERATOR ---------------
         opt_g.zero_grad()
         # z nuevamente (sin grad al encoder)
@@ -67,14 +64,23 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
         loss_g.backward()
         opt_g.step()
 
-        step += 1
+        # acumular
+        D_real = real_out.mean().item()
+        D_fake = fake_out.mean().item()
+        Wdist  = D_real - D_fake
+        GP     = float(gp.item())
 
-        # ---- imprimir cada N pasos y también en tqdm ----
-        if step % log_every == 0:
-            tqdm.write(
-                f"Step={step} | D_real={D_real:.3f} D_fake={D_fake:.3f} | "
-                f"W={Wdist:.3f} GP={GP:.3f} | loss_D={loss_c.item():.3f} loss_G={loss_g.item():.3f}"
-            )
+        tot_ld += loss_c.item(); tot_lg += loss_g.item()
+        tot_dreal += D_real; tot_dfake += D_fake
+        tot_w += Wdist; tot_gp += GP
+        steps += 1
+
+    # promedios por epoch
+    return {
+        "loss_D": tot_ld/steps, "loss_G": tot_lg/steps,
+        "D_real": tot_dreal/steps, "D_fake": tot_dfake/steps,
+        "W": tot_w/steps, "GP": tot_gp/steps, "steps": steps
+    }
 
 def main():
     if torch.cuda.is_available():
@@ -122,8 +128,14 @@ def main():
     # Entrenamiento
     total_epochs = 5
     for epoch in range(total_epochs):
-        logging.info(f"=== Epoch {epoch+1}/{total_epochs-1} (Stage-2) ===")
-        train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config, log_every=5)
+        logging.info(f"=== Epoch {epoch+1}/{total_epochs} (Stage-2) ===")
+        stats = train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
+        logging.info(
+            f"[Epoch {epoch+1}/{total_epochs}] "
+            f"D={stats['loss_D']:.3f} | G={stats['loss_G']:.3f} | "
+            f"D_real={stats['D_real']:.3f} D_fake={stats['D_fake']:.3f} | "
+            f"W={stats['W']:.3f} | GP={stats['GP']:.3f} | steps={stats['steps']}"
+        )
 
     # Guardar
     Path("checkpoints").mkdir(exist_ok=True)
