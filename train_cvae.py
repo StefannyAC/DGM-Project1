@@ -41,7 +41,6 @@ def train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weigh
             loss = (bce + beta * kl).mean()
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # estabilidad
         optimizer.step()
 
         total_recon += bce.sum().item()
@@ -64,7 +63,7 @@ def main():
     midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
     csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
     seq_len   = 32
-    batch_size = 64
+    batch_size = 512
     num_workers = 0  # Windows -> 0
 
     # loader (balanceado por defecto)
@@ -87,8 +86,9 @@ def main():
 
     model = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # estabilidad
 
-    epochs = 1
+    epochs = 5
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch+1}/{epochs}")
         train_cvae_epoch(model, dataloader, optimizer, device, beta=1.0, class_weights=w_vec)
