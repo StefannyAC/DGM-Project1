@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from data_pipeline import build_loader
+from data_pipeline import get_split_dataloader
 #from cvae import CVAE
 from cvae_seq2seq import CVAE
 from cgan import Generator, Critic, compute_gradient_penalty
@@ -185,7 +185,7 @@ def main():
     # modelos (arrancan en la primera T del currículo)
     cvae = CVAE(
         z_dim=z_dim, cond_dim=cond_dim, seq_len=curriculum[0],
-        pr_embed=pr_embed, ev_embed=ev_embed, cond_embed=cond_embed
+        ev_embed=ev_embed, cond_embed=cond_embed
     ).to(device)
     G = Generator(z_dim=z_dim, cond_dim=cond_dim, seq_len=curriculum[0]).to(device)
     D = Critic(cond_dim=cond_dim, seq_len=curriculum[0]).to(device)
@@ -226,10 +226,9 @@ def main():
         logging.info(f"\n===== CURRICULUM STAGE {stage}: seq_len={T}, epochs={n_epochs} =====")
 
         # DataLoader para el nuevo T
-        dataloader = build_loader(
-            midi_root=midi_root, csv_path=csv_path,
+        dataloader = get_split_dataloader(
             seq_len=T, batch_size=base_batch_size, num_workers=num_workers,
-            use_balanced_sampler=True,
+            use_balanced_sampler=True, split='train'
         )
         counts = Counter(dataloader.dataset.labels)
         class_weights = torch.tensor(

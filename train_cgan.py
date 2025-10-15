@@ -10,7 +10,7 @@ import logging
 from tqdm import tqdm
 from pathlib import Path
 
-from data_pipeline import build_loader
+from data_pipeline import get_split_dataloader
 from cgan import Generator, Critic, compute_gradient_penalty    
 #from cvae import CVAE
 from cvae_seq2seq import CVAE           
@@ -93,14 +93,11 @@ def main():
     batch_size = 512
 
     # Dataset (sin curriculum en Stage-2)
-    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
-    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
-    dataloader = build_loader(
-        midi_root=midi_root,
-        csv_path=csv_path,
+    dataloader = get_split_dataloader(
         seq_len=seq_len,
         batch_size=batch_size,
         use_balanced_sampler=True,
+        split="train"
     )
 
     # Modelos

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import logging
 from tqdm import tqdm
 
-from data_pipeline import build_loader
+from data_pipeline import get_split_dataloader
 #from cvae import CVAE
 from cvae_seq2seq import CVAE
 
@@ -60,20 +60,17 @@ def main():
     else:
         device = 'cpu'
     print(f"\nUsing Device: {device}\n")
-    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
-    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
     seq_len   = 32
     batch_size = 512
     num_workers = 0  # Windows -> 0
 
     # loader (balanceado por defecto)
-    dataloader = build_loader(
-        midi_root=midi_root,
-        csv_path=csv_path,
+    dataloader = get_split_dataloader(
         seq_len=seq_len,
         batch_size=batch_size,
         num_workers=num_workers,
         use_balanced_sampler=True,
+        split="train"
     )
 
     # pesos por clase para ELBO (inverso de frecuencia)
