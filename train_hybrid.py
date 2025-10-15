@@ -51,7 +51,7 @@ def check_shapes_once(X, E, y, cvae, G, D, T, z_dim, cond_dim):
         mu, logvar = cvae.encoder(X, E, y)
         assert mu.shape == (B, z_dim) and logvar.shape == (B, z_dim), "Encoder shapes inválidos"
         z = cvae.reparameterize(mu, logvar)
-        X_rec = cvae.decode(z, y)
+        X_rec = cvae.decode(z, y, T = T, teacher = None)
         assert X_rec.shape == (B, 128, T), f"Decoder shape inválido: {tuple(X_rec.shape)}!=(B,128,{T})"
         X_fake = G(z, y)
         r_out = D(X, y)
@@ -61,6 +61,11 @@ def check_shapes_once(X, E, y, cvae, G, D, T, z_dim, cond_dim):
 def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights):
     cvae.train(); G.train(); D.train()
     opt_cvae, opt_g, opt_d = opts
+
+    # Acumuladores por época
+    total_hyb, total_elbo, total_lg, total_ld = 0.0, 0.0, 0.0, 0.0
+    total_Dreal, total_Dfake, total_W, total_GP = 0.0, 0.0, 0.0, 0.0
+    n_steps = 0
 
     for batch in tqdm(dataloader, desc="Entrenando híbrido CVAE + C-GAN"):
         X = batch["piano_roll"].to(device).float().contiguous()
@@ -90,12 +95,18 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
             torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0)
             opt_d.step()
 
+            # métricas critic (última iter de critic en este batch será la “visible”)
+            D_real = real_out.mean().item()
+            D_fake = fake_out.mean().item()
+            Wdist  = D_real - D_fake
+            GP     = float(gp.item())
+
         # ----- Generator + CVAE -----
         opt_g.zero_grad()
         opt_cvae.zero_grad()
 
         # ELBO (MSE) con ponderación por clase
-        X_rec, mu, logvar = cvae(X, E, y)
+        X_rec, mu, logvar = cvae(X, E, y, teacher_prob=1.0)
         recon = F.mse_loss(X_rec, X, reduction='none').sum(dim=(1,2))
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
 
@@ -108,12 +119,42 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
         g_out = D(X_fake, y).squeeze(1)
         loss_g = -torch.mean(g_out)
 
-        loss = cfg["alpha"] * elbo + cfg["gamma"] * loss_g
-        loss.backward()
+        loss_hyb = cfg["alpha"] * elbo + cfg["gamma"] * loss_g
+        loss_hyb.backward()
         torch.nn.utils.clip_grad_norm_(cvae.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
         opt_g.step()
         opt_cvae.step()
+
+        # acumular (por batch)
+        total_hyb += loss_hyb.item()
+        total_elbo += elbo.item()
+        total_lg += loss_g.item()
+        total_ld += loss_d.item()
+        total_Dreal += D_real
+        total_Dfake += D_fake
+        total_W += Wdist
+        total_GP += GP
+        n_steps += 1
+
+        # checks simples (opcionales)
+        if abs(Wdist) < 0.05 and loss_g.item() < 0.01:
+            logging.debug("Posible estancamiento: |W|->0 y loss_g->0 en este batch.")
+
+    # promedios por época
+    if n_steps == 0:
+        return None
+    return {
+        "L_hyb": total_hyb / n_steps,
+        "ELBO": total_elbo / n_steps,
+        "L_G": total_lg / n_steps,
+        "L_D": total_ld / n_steps,
+        "D_real": total_Dreal / n_steps,
+        "D_fake": total_Dfake / n_steps,
+        "W": total_W / n_steps,
+        "GP": total_GP / n_steps,
+        "steps": n_steps
+    }
 
 def main():
     # device
@@ -222,7 +263,16 @@ def main():
         # Entrenar etapa
         for epoch in range(1, n_epochs + 1):
             logging.info(f"[Stage {stage}] Epoch {epoch}/{n_epochs} (batch={base_batch_size})")
-            train_hybrid_epoch(cvae, G, D, dataloader, (opt_cvae, opt_g, opt_d), device, cfg, class_weights)
+            stats = train_hybrid_epoch(cvae, G, D, dataloader, (opt_cvae, opt_g, opt_d), device, cfg, class_weights)
+            if stats is None:
+                logging.warning("Sin pasos válidos (quizá batch=1 todos los lotes).")
+                continue
+            logging.info(
+                f"[Stage {stage}][Epoch {epoch}] "
+                f"L_hyb={stats['L_hyb']:.4f} | ELBO={stats['ELBO']:.4f} | L_G={stats['L_G']:.4f} | "
+                f"L_D={stats['L_D']:.4f} | D_real={stats['D_real']:.3f} | D_fake={stats['D_fake']:.3f} | "
+                f"W={stats['W']:.3f} | GP={stats['GP']:.3f} | steps={stats['steps']}"
+            )
 
         # Guardar y preparar para transferir a la siguiente etapa
         Path("checkpoints").mkdir(parents=True, exist_ok=True)
