@@ -23,15 +23,7 @@ def as_long_labels(y):
 
 def reconfigure_cvae_for_T(cvae: CVAE, new_T: int, device: torch.device):
     """Ajusta el decoder del CVAE al nuevo seq_len (T)."""
-    if cvae.seq_len == new_T:
-        return
-    cvae.seq_len = new_T
-    cvae.t_reduced = math.ceil(new_T / 4)
-    dec_hidden = cvae.deconv[0].in_channels  # 256 en tu CVAE
-    cvae.fc_dec = torch.nn.Sequential(
-        torch.nn.Linear(cvae.z_dim + cvae.cond_embed.embedding_dim, dec_hidden * cvae.t_reduced),
-        torch.nn.ReLU(inplace=True),
-    ).to(device)
+    cvae.seq_len = new_T # actualizar atributo (seq_len) de la CVAE, ya no necesitamos fc_dec ni reinstanciar todo el modelo
 
 def rebuild_gd_for_T(z_dim: int, cond_dim: int, new_T: int, device: torch.device):
     """Crea nuevas instancias de G y D para un seq_len distinto."""
