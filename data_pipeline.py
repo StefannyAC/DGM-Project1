@@ -198,7 +198,7 @@ class MIDIDataset(Dataset):
         if not file_label_pairs:
             raise ValueError("No hay archivos MIDI etiquetados para procesar.")
 
-        for midi_path, genre_id in tqdm(file_label_pairs[:1000], desc="Procesando archivos MIDI"):
+        for midi_path, genre_id in tqdm(file_label_pairs, desc="Procesando archivos MIDI"):
             piano_roll = midi_to_piano_roll(midi_path, self.fs)
             if piano_roll is None or piano_roll.shape[1] < self.seq_len:
                 continue
@@ -243,8 +243,11 @@ class MIDIDataset(Dataset):
 
     def __getitem__(self, idx):
         seq_packed = self.sequences[idx]
-        seq = torch.from_numpy(unpack_matrix(seq_packed, (128, self.seq_len)))          # (128, T)
-        
+        seq_unpacked = unpack_matrix(seq_packed, (128, self.seq_len))
+        assert (seq_unpacked >= 0.0).all() and (seq_unpacked <= 1.0).all(), "Not binary"
+        assert np.isfinite(seq_unpacked).all(), "Found nan"
+        seq = torch.from_numpy(seq_unpacked)          # (128, T)
+       
         events = torch.from_numpy(self.event_encodings[idx]) # (N, 3)
         genre_id = int(self.labels[idx])
         cond_vec = torch.tensor([genre_id], dtype=torch.long)
@@ -265,7 +268,7 @@ def unpack_matrix(data: bytes, shape: tuple = (128, 128)) -> np.ndarray:
     Unpack 2048 bytes back into a 128x128 binary numpy array.
     """
     unpacked = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-    return unpacked.reshape(shape)
+    return unpacked.astype(np.float32).reshape(shape)
 
 
 def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
