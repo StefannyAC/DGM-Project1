@@ -98,6 +98,7 @@ class MIDIDataset(Dataset):
         csv_path: Optional[str] = None,    # requerido si label_mode="csv"
         csv_path_column: str = "path",
         csv_label_column: str = "genre_id",
+        split: str = "",
     ):
         """
         Args:
@@ -131,6 +132,9 @@ class MIDIDataset(Dataset):
         self.event_encodings: List[np.ndarray] = []
         self.labels: List[int] = []
 
+        self.split = split
+        if split != "":
+            assert split in str(self.csv_path), "El csv no coincide con el split"
         self._prepare_data()
 
     # -------------------------------
@@ -182,7 +186,11 @@ class MIDIDataset(Dataset):
 
         # cache separado por modo de labels
         cache_suffix = "csv" if self.label_mode == "csv" else self.label_mode
-        cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}.pkl"
+
+        if self.split == "":
+            cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}.pkl"
+        else:
+            cache_path = self.midi_root / f"cache_{cache_suffix}_seq{self.seq_len}_{self.split}.pkl"
 
         if self.cache and cache_path.exists():
             logging.info(f"Cargando cache desde {cache_path}")
@@ -272,7 +280,7 @@ def unpack_matrix(data: bytes, shape: tuple = (128, 128)) -> np.ndarray:
 
 
 def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
-                 use_balanced_sampler=True):
+                 use_balanced_sampler=True, split=""):
     dataset = MIDIDataset(
         midi_root=midi_root,
         seq_len=seq_len,
@@ -282,6 +290,7 @@ def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
         csv_path=csv_path,
         csv_path_column="path",
         csv_label_column="genre_id",
+        split=split
     )
 
     if use_balanced_sampler:
@@ -311,3 +320,54 @@ def build_loader(midi_root, csv_path, seq_len=128, batch_size=16, num_workers=0,
             collate_fn=collate_padded,
         )
     return loader
+
+
+ROOT = os.path.dirname(__file__)
+MIDI_ROOT = os.path.join(ROOT, "dataset/data/Lakh_MIDI_Dataset_Clean")
+CSV_PATH  = os.path.join(ROOT, "dataset/data/lakh_clean_merged_homologado.csv")
+
+if not os.path.exists(MIDI_ROOT):
+    raise RuntimeError("MIDIR_ROOT no existe")
+
+if not os.path.exists(CSV_PATH):
+    raise RuntimeError("CSV_PATH no existe")
+
+def get_csv_path(split: str=""):
+    if split == "":
+        return CSV_PATH
+
+    name, ext = os.path.splitext(CSV_PATH)
+    path = f'{name}_{split}{ext}'
+    if not os.path.exists(path):
+        raise ValueError(f"{path} no existe")
+    return path
+
+
+def get_split_dataset(seq_len: int, split: str=""):
+    return MIDIDataset(
+        MIDI_ROOT,
+        seq_len,
+        csv_path=get_csv_path(split),
+        split=split
+    )
+
+
+def get_split_dataloader(
+    seq_len=128,
+    batch_size=16,
+    num_workers=0,
+    use_balanced_sampler=True,
+    split=""
+):
+    csv_path = get_csv_path(split)
+    print(csv_path)
+    return build_loader(
+        MIDI_ROOT,
+        csv_path,
+        seq_len,
+        batch_size,
+        num_workers,
+        use_balanced_sampler,
+        split
+    )
+
