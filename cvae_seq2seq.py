@@ -113,7 +113,7 @@ class CVAE(nn.Module):
         return torch.nan_to_num(z, nan=0.0, posinf=50.0, neginf=-50.0) # evitamos NaN
 
     # --- Decoder ---
-    def decoder(self, z, y, T=None, teacher=None):
+    def decode(self, z, y, T=None, teacher=None):
         B = z.size(0); T = T or self.seq_len
         if y.ndim == 2 and y.size(-1) == 1: 
             y = y.squeeze(-1)
