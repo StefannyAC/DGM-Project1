@@ -1,6 +1,4 @@
 # train_cgan.py
-
-# train_cgan.py
 # ============================================================
 # Stage-2: Preentrenamiento de la C-GAN ACOPLADA a la CVAE
 #   - z proviene del ENCODER de la CVAE (preentrenada en Stage-1)
@@ -14,7 +12,8 @@ from pathlib import Path
 
 from data_pipeline import build_loader
 from cgan import Generator, Critic, compute_gradient_penalty    
-from cvae import CVAE         
+#from cvae import CVAE
+from cvae_seq2seq import CVAE           
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -115,7 +114,7 @@ def main():
     Path("checkpoints").mkdir(exist_ok=True)
     torch.save(gen.state_dict(),  "checkpoints/generator_pretrained.pth")
     torch.save(disc.state_dict(), "checkpoints/critic_pretrained.pth")
-    logging.info("✅ C-GAN preentrenada (acoplada a CVAE) guardada en checkpoints/")
+    logging.info("C-GAN preentrenada (acoplada a CVAE) guardada en checkpoints/")
 
 if __name__ == "__main__":
     main()

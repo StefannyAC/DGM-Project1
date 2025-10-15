@@ -5,7 +5,8 @@ import logging
 from tqdm import tqdm
 
 from data_pipeline import build_loader
-from cvae import CVAE
+#from cvae import CVAE
+from cvae_seq2seq import CVAE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 

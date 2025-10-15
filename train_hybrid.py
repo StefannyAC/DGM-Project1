@@ -10,7 +10,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from data_pipeline import build_loader
-from cvae import CVAE
+#from cvae import CVAE
+from cvae_seq2seq import CVAE
 from cgan import Generator, Critic, compute_gradient_penalty
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -145,7 +146,7 @@ def main():
     ev_embed = 64
     cond_embed = 16
 
-    base_batch_size = 64   # ← batch fijo
+    base_batch_size = 64   # <- batch fijo
     num_workers = 0
 
     # modelos (arrancan en la primera T del currículo)
