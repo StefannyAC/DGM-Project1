@@ -87,7 +87,7 @@ def main():
         device = 'cpu'
     print(f"\nUsing Device: {device}\n")
     seq_len   = 32
-    batch_size = 512
+    batch_size = 2048
     num_workers = 0  # Windows -> 0
 
     # loader (balanceado por defecto)
@@ -120,7 +120,7 @@ def main():
     best_val_elbo = float('inf')
     best_path = Path("checkpoints/cvae_pretrained_best.pth")
 
-    beta = 1.0
+    beta = 0.01
     epochs = 5
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch+1}/{epochs}")
