@@ -231,14 +231,14 @@ def main():
 
     # --- config ---
     curriculum = [32, 64, 128]   # seq_len reales por etapa
-    epochs_per = [1, 1, 1]       # ajusta a gusto
+    epochs_per = [10, 10, 10]       # ajusta a gusto
 
     z_dim = 128
     cond_dim = 4
     ev_embed = 64
     cond_embed = 16
 
-    base_batch_size = 64   # <- batch fijo
+    base_batch_size = 512   # <- batch fijo
     num_workers = 0
 
     # modelos (arrancan en la primera T del currículo)
@@ -269,7 +269,7 @@ def main():
     opt_d    = torch.optim.Adam(D.parameters(),    lr=1e-4, betas=(0.5, 0.999))
 
     cfg = {
-        "beta": 1.0,
+        "beta": 0.01,
         "alpha": 1.0,
         "gamma": 0.5,
         "critic_iters": 5,
