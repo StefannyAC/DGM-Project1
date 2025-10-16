@@ -28,13 +28,16 @@ def encode_with_cvae(cvae, X, E, y):
 def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, config, log_every=5):
     generator.train(); critic.train(); cvae.eval()  # CVAE congelada aquí
     
-    tot_ld = tot_lg = tot_dreal = tot_dfake = tot_w = tot_gp = 0.0
-    steps = 0
+    agg = {"loss_D":0.0, "loss_G":0.0, "D_real":0.0, "D_fake":0.0, "W":0.0, "GP":0.0, "steps":0}
 
     for batch in tqdm(dataloader, desc="Stage-2: Entrenando C-GAN acoplada a CVAE"):
         X  = batch["piano_roll"].to(device)     # (B, 128, T)
         E  = batch["events"].to(device)         # (B, N, 3)
         y  = batch["conditions"].to(device)     # (B, 1) género
+
+        # Evitar batch=1 (por .squeeze() en el Critic/Generator condicional)
+        if X.size(0) == 1:
+            continue
 
         # --------- ENTRENAR CRÍTICO (WGAN-GP) ----------
         for _ in range(config["critic_iters"]):
@@ -68,19 +71,65 @@ def train_cgan_epoch(generator, critic, cvae, dataloader, opt_g, opt_c, device, 
         D_real = real_out.mean().item()
         D_fake = fake_out.mean().item()
         Wdist  = D_real - D_fake
-        GP     = float(gp.item())
+        GP     = gp.item()
 
-        tot_ld += loss_c.item(); tot_lg += loss_g.item()
-        tot_dreal += D_real; tot_dfake += D_fake
-        tot_w += Wdist; tot_gp += GP
-        steps += 1
+        agg["loss_D"] += loss_c.item()
+        agg["loss_G"] += loss_g.item()
+        agg["D_real"] += D_real
+        agg["D_fake"] += D_fake
+        agg["W"]      += Wdist
+        agg["GP"]     += GP
+        agg["steps"]  += 1
 
     # promedios por epoch
-    return {
-        "loss_D": tot_ld/steps, "loss_G": tot_lg/steps,
-        "D_real": tot_dreal/steps, "D_fake": tot_dfake/steps,
-        "W": tot_w/steps, "GP": tot_gp/steps, "steps": steps
-    }
+    if agg["steps"] == 0:
+        return None
+    for k in list(agg.keys()):
+        if k != "steps":
+            agg[k] /= agg["steps"]
+    return agg
+
+@torch.no_grad()
+def validate_cgan_epoch(generator, critic, cvae, dataloader, device, cfg):
+    generator.eval(); critic.eval(); cvae.eval()
+
+    agg = {"loss_D":0.0, "loss_G":0.0, "D_real":0.0, "D_fake":0.0, "W":0.0, "steps":0}
+
+    for batch in tqdm(dataloader, desc="C-GAN Val", leave=False):
+        X  = batch["piano_roll"].to(device)
+        E  = batch["events"].to(device)
+        y  = batch["conditions"].to(device)
+
+        if X.size(0) == 1:
+            continue
+
+        z = encode_with_cvae(cvae, X, E, y)
+        X_fake = generator(z, y)
+
+        real_out = critic(X, y)
+        fake_out = critic(X_fake, y)
+
+        # Pérdidas "proxy" de validación (sin GP porque es muy costoso y ruidoso)
+        loss_c = -torch.mean(real_out) + torch.mean(fake_out)
+        loss_g = -torch.mean(fake_out)
+
+        D_real = real_out.mean().item()
+        D_fake = fake_out.mean().item()
+        Wdist  = D_real - D_fake
+
+        agg["loss_D"] += loss_c.item()
+        agg["loss_G"] += loss_g.item()
+        agg["D_real"] += D_real
+        agg["D_fake"] += D_fake
+        agg["W"]      += Wdist
+        agg["steps"]  += 1
+
+    if agg["steps"] == 0:
+        return None
+    for k in list(agg.keys()):
+        if k != "steps":
+            agg[k] /= agg["steps"]
+    return agg
 
 def main():
     if torch.cuda.is_available():
@@ -99,6 +148,12 @@ def main():
         use_balanced_sampler=True,
         split="train"
     )
+    val_loader = get_split_dataloader(
+        seq_len=seq_len,
+        batch_size=batch_size,
+        use_balanced_sampler=False,  # en val normalmente no balanceamos
+        split="val",
+    )
 
     # Modelos
     cvae = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
@@ -106,8 +161,8 @@ def main():
     disc = Critic(cond_dim=4, seq_len=seq_len).to(device)
 
     # Cargar CVAE preentrenada (Stage-1)
-    ckpt_cvae = Path("checkpoints/cvae_pretrained.pth")
-    assert ckpt_cvae.exists(), "Falta checkpoints/cvae_pretrained.pth (ejecuta train_cvae.py primero)."
+    ckpt_cvae = Path("checkpoints/cvae_pretrained_best.pth")
+    assert ckpt_cvae.exists(), "Falta checkpoints/cvae_pretrained_best.pth (ejecuta train_cvae.py primero)."
     cvae.load_state_dict(torch.load(ckpt_cvae, map_location=device))
     for p in cvae.parameters():
         p.requires_grad_(False)  # congelada en Stage-2
@@ -122,22 +177,44 @@ def main():
         "critic_iters": 5
     }
 
+    # ---- training loop ----
+    best_val_g = float("inf")  # queremos minimizar loss_G (en validation entre más negativa = mejor)
+    Path("checkpoints").mkdir(exist_ok=True)
+
     # Entrenamiento
     total_epochs = 5
     for epoch in range(total_epochs):
         logging.info(f"=== Epoch {epoch+1}/{total_epochs} (Stage-2) ===")
-        stats = train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
+        train_stats = train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
+        if train_stats is None:
+            logging.warning("Entrenamiento sin pasos válidos (¿batches de tamaño 1?).")
+            continue
         logging.info(
-            f"[Epoch {epoch+1}/{total_epochs}] "
-            f"D={stats['loss_D']:.3f} | G={stats['loss_G']:.3f} | "
-            f"D_real={stats['D_real']:.3f} D_fake={stats['D_fake']:.3f} | "
-            f"W={stats['W']:.3f} | GP={stats['GP']:.3f} | steps={stats['steps']}"
+            f"[Train] D={train_stats['loss_D']:.3f} | G={train_stats['loss_G']:.3f} | "
+            f"D_real={train_stats['D_real']:.3f} D_fake={train_stats['D_fake']:.3f} | "
+            f"W={train_stats['W']:.3f} | GP={train_stats['GP']:.3f} | steps={train_stats['steps']}"
         )
 
-    # Guardar
-    Path("checkpoints").mkdir(exist_ok=True)
-    torch.save(gen.state_dict(),  "checkpoints/generator_pretrained.pth")
-    torch.save(disc.state_dict(), "checkpoints/critic_pretrained.pth")
+        val_stats = validate_cgan_epoch(gen, disc, cvae, val_loader, device, config)
+        if val_stats is None:
+            logging.warning("Validación sin pasos válidos.")
+            continue
+        logging.info(
+            f"[Val]   D={val_stats['loss_D']:.3f} | G={val_stats['loss_G']:.3f} | "
+            f"D_real={val_stats['D_real']:.3f} D_fake={val_stats['D_fake']:.3f} | "
+            f"W={val_stats['W']:.3f}"
+        )
+
+        # guardar "best" por val loss_G
+        if val_stats["loss_G"] < best_val_g:
+            best_val_g = val_stats["loss_G"]
+            torch.save(gen.state_dict(), "checkpoints/generator_pretrained_best.pth")
+            torch.save(disc.state_dict(), "checkpoints/critic_pretrained_best.pth")
+            logging.info(f"Nuevo mejor val loss_G={best_val_g:.3f} -> checkpoints/_best.pth")
+
+    # Guardamos por si acaso la última
+    torch.save(gen.state_dict(),  "checkpoints/generator_pretrained_last.pth")
+    torch.save(disc.state_dict(), "checkpoints/critic_pretrained_last.pth")
     logging.info("C-GAN preentrenada (acoplada a CVAE) guardada en checkpoints/")
 
 if __name__ == "__main__":

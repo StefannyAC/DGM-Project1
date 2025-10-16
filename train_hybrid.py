@@ -99,7 +99,7 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
             D_real = real_out.mean().item()
             D_fake = fake_out.mean().item()
             Wdist  = D_real - D_fake
-            GP     = float(gp.item())
+            GP     = gp.item()
 
         # ----- Generator + CVAE -----
         opt_g.zero_grad()
@@ -156,6 +156,69 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
         "steps": n_steps
     }
 
+@torch.no_grad()
+def validate_hybrid_epoch(cvae, G, D, dataloader, device, cfg, class_weights):
+    """Validación: sin updates. Usamos proxy L_D (real-fake) y L_G exactamente igual; sin GP."""
+    cvae.eval(); G.eval(); D.eval()
+
+    total_hyb = total_elbo = total_lg = total_ld = 0.0
+    total_Dreal = total_Dfake = total_W = 0.0
+    n_steps = 0
+
+    for batch in tqdm(dataloader, desc="Hybrid Val", leave=False):
+        X = batch["piano_roll"].to(device).float().contiguous()
+        E = batch["events"].to(device).float()
+        y = batch["conditions"].to(device)
+        y_flat = as_long_labels(y)
+
+        if X.size(0) == 1:
+            continue
+
+        # ELBO con teacher forcing para medir reconstrucción limpia
+        X_rec, mu, logvar = cvae(X, E, y, teacher_prob=1.0)
+        recon = F.mse_loss(X_rec, X, reduction='none').sum(dim=(1,2))
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
+        w = class_weights[y_flat]
+        elbo = (w * (recon + cfg["beta"] * kl)).mean()
+
+        z = cvae.reparameterize(mu, logvar)
+        X_fake = G(z, y)
+        real_out = D(X, y).squeeze(1)
+        fake_out = D(X_fake, y).squeeze(1)
+
+        # proxy de D (sin GP)
+        loss_d = -torch.mean(real_out) + torch.mean(fake_out)
+        loss_g = -torch.mean(fake_out)
+
+        loss_hyb = cfg["alpha"] * elbo + cfg["gamma"] * loss_g
+
+        D_real = real_out.mean().item()
+        D_fake = fake_out.mean().item()
+        Wdist  = D_real - D_fake
+
+        total_hyb += loss_hyb.item()
+        total_elbo += elbo.item()
+        total_lg += loss_g.item()
+        total_ld += loss_d.item()
+        total_Dreal += D_real
+        total_Dfake += D_fake
+        total_W += Wdist
+        n_steps += 1
+
+    if n_steps == 0:
+        return None
+    return {
+        "L_hyb": total_hyb / n_steps,
+        "ELBO": total_elbo / n_steps,
+        "L_G": total_lg / n_steps,
+        "L_D": total_ld / n_steps,
+        "D_real": total_Dreal / n_steps,
+        "D_fake": total_Dfake / n_steps,
+        "W": total_W / n_steps,
+        "steps": n_steps
+    }
+
+
 def main():
     # device
     if torch.cuda.is_available():
@@ -167,15 +230,11 @@ def main():
     print(f"\nUsing Device: {device}\n")
 
     # --- config ---
-    midi_root = "dataset/data/Lakh_MIDI_Dataset_Clean"
-    csv_path  = "dataset/data/lakh_clean_merged_homologado.csv"
-
     curriculum = [32, 64, 128]   # seq_len reales por etapa
     epochs_per = [1, 1, 1]       # ajusta a gusto
 
     z_dim = 128
     cond_dim = 4
-    pr_embed = 256
     ev_embed = 64
     cond_embed = 16
 
@@ -191,15 +250,15 @@ def main():
     D = Critic(cond_dim=cond_dim, seq_len=curriculum[0]).to(device)
 
     # Carga preentrenos (si existen)
-    ckpt_cvae = Path("checkpoints/cvae_pretrained.pth")
+    ckpt_cvae = Path("checkpoints/cvae_pretrained_best.pth")
     if ckpt_cvae.exists():
         cvae.load_state_dict(torch.load(ckpt_cvae, map_location=device))
         logging.info("CVAE preentrenada cargada.")
-    ckpt_g = Path("checkpoints/generator_pretrained.pth")
+    ckpt_g = Path("checkpoints/generator_pretrained_best.pth")
     if ckpt_g.exists():
         G.load_state_dict(torch.load(ckpt_g, map_location=device))
         logging.info("Generator preentrenado cargado.")
-    ckpt_d = Path("checkpoints/critic_pretrained.pth")
+    ckpt_d = Path("checkpoints/critic_pretrained_best.pth")
     if ckpt_d.exists():
         D.load_state_dict(torch.load(ckpt_d, map_location=device))
         logging.info("Critic preentrenado cargado.")
@@ -218,6 +277,8 @@ def main():
         "recon_loss": "mse",
     }
 
+    Path("checkpoints").mkdir(parents=True, exist_ok=True)
+    logging.info("=== Iniciando entrenamiento híbrido CVAE + C-GAN con currículum ===")
     # === Curriculum real: 32 -> 64 -> 128 ===
     # T representa la longitud temporal (seq_len)
     # En cada etapa se reconfiguran CVAE, G y D para el nuevo T
@@ -230,6 +291,11 @@ def main():
             seq_len=T, batch_size=base_batch_size, num_workers=num_workers,
             use_balanced_sampler=True, split='train'
         )
+        val_loader = get_split_dataloader(
+            seq_len=T, batch_size=base_batch_size, num_workers=num_workers,
+            use_balanced_sampler=False, split='val'
+        )
+
         counts = Counter(dataloader.dataset.labels)
         class_weights = torch.tensor(
             [1.0 / max(counts.get(c, 1), 1) for c in range(cond_dim)],
@@ -259,26 +325,49 @@ def main():
             check_shapes_once(X, E, y, cvae, G, D, T, z_dim, cond_dim)
             break
 
+        # early best-tracking por etapa
+        best_val = float('inf')
+        best_tag = f"_best_T{T}.pth"
+
         # Entrenar etapa
         for epoch in range(1, n_epochs + 1):
             logging.info(f"[Stage {stage}] Epoch {epoch}/{n_epochs} (batch={base_batch_size})")
-            stats = train_hybrid_epoch(cvae, G, D, dataloader, (opt_cvae, opt_g, opt_d), device, cfg, class_weights)
-            if stats is None:
+            train_stats = train_hybrid_epoch(cvae, G, D, dataloader, (opt_cvae, opt_g, opt_d), device, cfg, class_weights)
+            if train_stats is None:
                 logging.warning("Sin pasos válidos (quizá batch=1 todos los lotes).")
                 continue
             logging.info(
-                f"[Stage {stage}][Epoch {epoch}] "
-                f"L_hyb={stats['L_hyb']:.4f} | ELBO={stats['ELBO']:.4f} | L_G={stats['L_G']:.4f} | "
-                f"L_D={stats['L_D']:.4f} | D_real={stats['D_real']:.3f} | D_fake={stats['D_fake']:.3f} | "
-                f"W={stats['W']:.3f} | GP={stats['GP']:.3f} | steps={stats['steps']}"
+                f"[Train] L_hyb={train_stats['L_hyb']:.4f} | ELBO={train_stats['ELBO']:.4f} | "
+                f"L_G={train_stats['L_G']:.4f} | L_D={train_stats['L_D']:.4f} | "
+                f"D_real={train_stats['D_real']:.3f} D_fake={train_stats['D_fake']:.3f} | "
+                f"W={train_stats['W']:.3f} | GP={train_stats['GP']:.3f} | steps={train_stats['steps']}"
             )
 
+            val_stats = validate_hybrid_epoch(cvae, G, D, val_loader, device, cfg, class_weights)
+            if val_stats is None:
+                logging.warning("Validación sin pasos válidos.")
+                continue
+            logging.info(
+                f"[Val]   L_hyb={val_stats['L_hyb']:.4f} | ELBO={val_stats['ELBO']:.4f} | "
+                f"L_G={val_stats['L_G']:.4f} | L_D={val_stats['L_D']:.4f} | "
+                f"D_real={val_stats['D_real']:.3f} D_fake={val_stats['D_fake']:.3f} | "
+                f"W={val_stats['W']:.3f} | steps={val_stats['steps']}"
+            )
+
+            # Guardar "best" por val L_hyb
+            if val_stats["L_hyb"] < best_val:
+                best_val = val_stats["L_hyb"]
+                torch.save(cvae.state_dict(), f"checkpoints/hybrid_cvae{best_tag}")
+                torch.save(G.state_dict(),    f"checkpoints/hybrid_G{best_tag}")
+                torch.save(D.state_dict(),    f"checkpoints/hybrid_D{best_tag}")
+                logging.info(f"Nuevo mejor Val L_hyb={best_val:.4f} (T={T})")
+
+
         # Guardar y preparar para transferir a la siguiente etapa
-        Path("checkpoints").mkdir(parents=True, exist_ok=True)
-        torch.save(cvae.state_dict(), f"checkpoints/hybrid_cvae_T{T}.pth")
-        torch.save(G.state_dict(),    f"checkpoints/hybrid_G_T{T}.pth")
-        torch.save(D.state_dict(),    f"checkpoints/hybrid_D_T{T}.pth")
-        logging.info(f"Guardados checkpoints para T={T}")
+        torch.save(cvae.state_dict(), f"checkpoints/hybrid_cvae_T{T}_last.pth")
+        torch.save(G.state_dict(),    f"checkpoints/hybrid_G_T{T}_last.pth")
+        torch.save(D.state_dict(),    f"checkpoints/hybrid_D_T{T}_last.pth")
+        logging.info(f"Guardados checkpoints (last) para T={T}")
 
         prev_G, prev_D = G, D  # para transferir pesos a la siguiente etapa
 
