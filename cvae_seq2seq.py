@@ -20,8 +20,8 @@ class EventEncoder(nn.Module):
     def __init__(self, in_dim=3, ev_embed=64):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 64), nn.ReLU(inplace=True),
-            nn.Linear(64, ev_embed), nn.ReLU(inplace=True),
+            nn.Linear(in_dim, 16), nn.ReLU(inplace=True),
+            nn.Linear(16, ev_embed), nn.ReLU(inplace=True),
         )
         self.ev_embed = ev_embed
 

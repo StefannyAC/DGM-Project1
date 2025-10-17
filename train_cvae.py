@@ -87,7 +87,7 @@ def main():
         device = 'cpu'
     print(f"\nUsing Device: {device}\n")
     seq_len   = 32
-    batch_size = 2048
+    batch_size = 512
     num_workers = 0  # Windows -> 0
 
     # loader (balanceado por defecto)
@@ -112,7 +112,16 @@ def main():
         dtype=torch.float32, device=device
     )
 
-    model = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
+    model = CVAE(
+        z_dim=32,
+        cond_dim=4,
+        seq_len=seq_len,
+        ev_embed=16,
+        cond_embed=4,
+        enc_hid=16,
+        dec_hid=16
+    )
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # estabilidad
 
@@ -120,8 +129,8 @@ def main():
     best_val_elbo = float('inf')
     best_path = Path("checkpoints/cvae_pretrained_best.pth")
 
-    beta = 0.01
-    epochs = 5
+    beta = 0.05
+    epochs = 10
     for epoch in range(epochs):
         logging.info(f"Epoch {epoch+1}/{epochs}")
         train_stats = train_cvae_epoch(model, dataloader, optimizer, device, beta=beta, class_weights=w_vec)
