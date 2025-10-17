@@ -61,7 +61,7 @@ def mse_on_loader(cvae, loader, device):
 
 def main():
     # --- config ---
-    T = 128  # longitud que quieras evaluar
+    T = 32  # longitud que quieras evaluar
     batch_size = 128
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     print(f"Device: {device}")
@@ -79,7 +79,13 @@ def main():
     cvae_ckpt = pick(f"checkpoints/hybrid_cvae_best_T{T}.pth",  f"checkpoints/hybrid_cvae_T{T}_last.pth")
     assert Path(cvae_ckpt).is_file(), "Faltan checkpoints del híbrido."
 
-    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=T).to(device)
+    cvae = CVAE(z_dim=32,
+        cond_dim=4,
+        seq_len=T,
+        ev_embed=16,
+        cond_embed=4,
+        enc_hid=16,
+        dec_hid=16).to(device)
     cvae.load_state_dict(torch.load(cvae_ckpt, map_location=device))
 
     df = mse_on_loader(cvae, test_loader, device)

@@ -61,7 +61,7 @@ CONFIG = {
 
     # curriculum a evaluar
     # "stages_T": [32, 64, 128], # si queremos revisar la evolución completa
-    "stages_T": [128], # solo queremos el final
+    "stages_T": [32], # solo queremos el final
 
     # carpetas salida
     "outdir": "eval_fad_hybrid_samples_Transformer",
@@ -401,11 +401,17 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     )
 
     # modelos
-    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=T).to(device)
+    cvae = CVAE(z_dim=32,
+        cond_dim=4,
+        seq_len=T,
+        ev_embed=16,
+        cond_embed=4,
+        enc_hid=16,
+        dec_hid=16).to(device)
     cvae.load_state_dict(torch.load(cvae_ckpt, map_location=device))
     cvae.eval()
 
-    gen = Generator(z_dim=128, cond_dim=4, seq_len=T).to(device)
+    gen = Generator(z_dim=32, cond_dim=4, seq_len=T).to(device)
     gen.load_state_dict(torch.load(gen_ckpt, map_location=device))
     gen.eval()
 
