@@ -233,21 +233,36 @@ def main():
     curriculum = [32, 64, 128]   # seq_len reales por etapa
     epochs_per = [10, 10, 10]       # ajusta a gusto
 
-    z_dim = 128
+    z_dim = 32
     cond_dim = 4
-    ev_embed = 64
-    cond_embed = 16
+    ev_embed = 16
+    cond_embed = 4
 
     base_batch_size = 512   # <- batch fijo
     num_workers = 0
 
     # modelos (arrancan en la primera T del currículo)
     cvae = CVAE(
-        z_dim=z_dim, cond_dim=cond_dim, seq_len=curriculum[0],
-        ev_embed=ev_embed, cond_embed=cond_embed
+        z_dim=z_dim,
+        cond_dim=cond_dim,
+        seq_len=curriculum[0],
+        ev_embed=ev_embed,
+        cond_embed=cond_embed,
+        enc_hid=16,
+        dec_hid=16,
     ).to(device)
-    G = Generator(z_dim=z_dim, cond_dim=cond_dim, seq_len=curriculum[0]).to(device)
-    D = Critic(cond_dim=cond_dim, seq_len=curriculum[0]).to(device)
+    G = Generator(
+        z_dim=z_dim,
+        cond_dim=cond_dim,
+        seq_len=curriculum[0],
+        hidden_dim=32
+    ).to(device)
+    D = Critic(
+        cond_dim=cond_dim,
+        seq_len=curriculum[0],
+        input_dim=128,
+        hidden_dim=32
+    ).to(device)
 
     # Carga preentrenos (si existen)
     ckpt_cvae = Path("checkpoints/cvae_pretrained_best.pth")

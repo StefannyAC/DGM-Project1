@@ -156,9 +156,26 @@ def main():
     )
 
     # Modelos
-    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
-    gen  = Generator(z_dim=128, cond_dim=4, seq_len=seq_len).to(device)
-    disc = Critic(cond_dim=4, seq_len=seq_len).to(device)
+    cvae = CVAE(
+        z_dim=32,
+        cond_dim=4,
+        seq_len=seq_len,
+        ev_embed=16,
+        cond_embed=4,
+        enc_hid=16,
+        dec_hid=16,
+    ).to(device)
+    gen = Generator(
+        z_dim=32,
+        cond_dim=4,
+        seq_len=seq_len,
+        hidden_dim=32
+    ).to(device)
+    disc = Critic(
+        cond_dim=4,
+        seq_len=seq_len,
+        hidden_dim=32
+    ).to(device)
 
     # Cargar CVAE preentrenada (Stage-1)
     ckpt_cvae = Path("checkpoints/cvae_pretrained_best.pth")
@@ -182,7 +199,7 @@ def main():
     Path("checkpoints").mkdir(exist_ok=True)
 
     # Entrenamiento
-    total_epochs = 5
+    total_epochs = 20
     for epoch in range(total_epochs):
         logging.info(f"=== Epoch {epoch+1}/{total_epochs} (Stage-2) ===")
         train_stats = train_cgan_epoch(gen, disc, cvae, dataloader, opt_g, opt_c, device, config)
