@@ -88,8 +88,8 @@ def piano_roll_to_audio(piano_roll, fs_roll=16, fs_audio=44100, duration=None):
     return audio
 
 
-def get_dataset():
-    return MIDIDataset(MIDI_ROOT, 128, csv_path=CSV_PATH)
+def get_dataset(seq_len = 128):
+    return MIDIDataset(MIDI_ROOT, seq_len, csv_path=CSV_PATH)
 
 
 def main():
