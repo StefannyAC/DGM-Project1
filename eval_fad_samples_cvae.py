@@ -61,11 +61,11 @@ CONFIG = {
 
     # curriculum a evaluar
     # "stages_T": [32, 64, 128], # si queremos revisar la evolución completa
-    "stages_T": [128], # solo queremos el final
+    "stages_T": [32], # solo queremos el final
 
     # carpetas salida
-    "outdir": "eval_fad_hybrid_samples_Transformer",
-    "results_csv": "eval_fad_hybrid_samples_Transformer/fad_results.csv",
+    "outdir": "eval_fad_cvae_samples_Transformer",
+    "results_csv": "eval_fad_cvae_samples_Transformer/fad_results.csv",
 
     # pesos VGGish (None = aleatorios)
     "vggish_ckpt": "checkpoints/vggish-10086976.pth",
@@ -81,8 +81,13 @@ def pianoroll_to_pretty_midi(X_bin, fs=16, program=0, velocity=80, min_dur_frame
     X_bin: (128, T) binaria {0,1}
     Devuelve pretty_midi.PrettyMIDI.
     """
+    X_bin = np.asarray(X_bin)
+    if X_bin.ndim != 2 or X_bin.shape[0] != 128:
+        raise ValueError(f"Input debe tener la forma (128, T), pero se recibió {X_bin.shape}")
+    
     pm = pretty_midi.PrettyMIDI()
     inst = pretty_midi.Instrument(program=program)
+    
     T = X_bin.shape[1]
 
     for pitch in range(128):
@@ -304,7 +309,7 @@ def _pick_ckpt(best_path, last_path):
 # Recolección de audio
 # ============================
 def collect_audio_from_loader(
-    dataloader, cvae, gen, device, outdir, per_genre=200, threshold=0.5,
+    dataloader, cvae, device, outdir, per_genre=200, threshold=0.5,
     fs_pr=16, min_dur_frames=1, velocity=80, program=0, mode="real", min_notes_threshold=5,seed=None
 ):
     """
@@ -330,7 +335,7 @@ def collect_audio_from_loader(
         if mode == "fake":
             with torch.no_grad():
                 z = torch.randn(B, cvae.z_dim, device=device)
-                Xg = gen(z, y)                       # (B,128,T), [0,1]
+                Xg = cvae.decode(z, y, T=T)          # (B,128,T), [0,1]
                 Xb = (Xg >= threshold).float()
         else:
             Xb = (X >= threshold).float()
@@ -382,14 +387,11 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     Devuelve list[dict] con métricas.
     """
     # elige checkpoints best -> last
-    best_cvae = f"checkpoints/hybrid_cvae_best_T{T}.pth"
-    last_cvae = f"checkpoints/hybrid_cvae_T{T}_last.pth"
-    best_gen  = f"checkpoints/hybrid_G_best_T{T}.pth"
-    last_gen  = f"checkpoints/hybrid_G_T{T}_last.pth"
+    best_cvae = f"checkpoints/cvae_pretrained_best.pth"
+    last_cvae = f"checkpoints/cvae_pretrained_best_last.pth"
 
     cvae_ckpt = _pick_ckpt(best_cvae, last_cvae)
-    gen_ckpt  = _pick_ckpt(best_gen,  last_gen)
-    assert cvae_ckpt and gen_ckpt, f"Faltan checkpoints para T={T}"
+    assert cvae_ckpt, f"Falta checkpoint para T={T}"
 
     # loader TEST para T
     loader = get_split_dataloader(
@@ -401,13 +403,15 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     )
 
     # modelos
-    cvae = CVAE(z_dim=128, cond_dim=4, seq_len=T).to(device)
+    cvae = CVAE(z_dim=32,
+        cond_dim=4,
+        seq_len=T,
+        ev_embed=16,
+        cond_embed=4,
+        enc_hid=16,
+        dec_hid=16).to(device)
     cvae.load_state_dict(torch.load(cvae_ckpt, map_location=device))
     cvae.eval()
-
-    gen = Generator(z_dim=128, cond_dim=4, seq_len=T).to(device)
-    gen.load_state_dict(torch.load(gen_ckpt, map_location=device))
-    gen.eval()
 
     # carpetas de audio (borra y recrea)
     stage_out = Path(CONFIG["outdir"]) / f"T{T}"
@@ -420,7 +424,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
 
     # 1) recolectar audios reales y generados
     real_paths = collect_audio_from_loader(
-        loader, cvae, gen, device, real_dir,
+        loader, cvae, device, real_dir,
         per_genre=CONFIG["per_genre_eval_samples"],
         threshold=CONFIG["threshold"],
         fs_pr=CONFIG["fs_pr"],
@@ -431,7 +435,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
         min_notes_threshold=5  # Evita clips casi silenciosos
     )
     fake_paths = collect_audio_from_loader(
-        loader, cvae, gen, device, fake_dir,
+        loader, cvae, device, fake_dir,
         per_genre=CONFIG["per_genre_eval_samples"],
         threshold=CONFIG["threshold"],
         fs_pr=CONFIG["fs_pr"],
@@ -439,7 +443,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
         velocity=CONFIG["velocity"],
         program=CONFIG["program"],
         mode="fake",
-        min_notes_threshold=1, # Acepta clips con al menos 1 nota
+        min_notes_threshold=3, # Acepta clips con al menos 1 nota
         seed=123  # para reproducibilidad en fake
     )
 
