@@ -4,3 +4,6 @@ tqdm
 pretty_midi
 pandas
 mido
+torchvggish
+soundfile
+fluidsynth ---> se recomienda instalar con https://chocolatey.org/install como choco install fluidsynth
