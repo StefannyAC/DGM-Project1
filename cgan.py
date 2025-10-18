@@ -64,7 +64,7 @@ class Generator(nn.Module):
         Returns:
             piano_roll: Tensor (B, output_dim, seq_len)
         """
-        cond_emb = self.embed(cond.squeeze())         # (B, cond_dim)
+        cond_emb = self.embed(cond.squeeze(1))         # (B, cond_dim)
         x = torch.cat([z, cond_emb], dim=1)           # (B, z_dim + cond_dim)
         out = self.net(x)
         return out.view(-1, self.output_dim, self.seq_len)
@@ -115,7 +115,7 @@ class Critic(nn.Module):
         Returns:
             Real/Fake score: (B, 1)
         """
-        cond_emb = self.embed(cond.squeeze())                # (B, cond_dim)
+        cond_emb = self.embed(cond.squeeze(1))                # (B, cond_dim)
         cond_map = cond_emb.unsqueeze(-1).repeat(1, 1, x.size(-1))  # (B, cond_dim, T)
         x_cond = torch.cat([x, cond_map], dim=1)             # (B, input_dim+cond_dim, T)
         features = self.conv(x_cond)
