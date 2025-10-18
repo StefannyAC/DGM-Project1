@@ -7,3 +7,11 @@ eval_fad_hybrid/
 eval_fad_hybrid_samples/
 audio.py
 eval_mse_T128.csv
+eval_fad_hybrid_samples_Transformer/
+eval_fad_hybrid_Transformer/
+eval_fad_cvae_samples_Transformer/
+eval_fad_cvae_Transformer/
+eval_mse_results/
+eval_fad_cvae.py
+eval_elbo_results/
+eval_mse_cvae.py

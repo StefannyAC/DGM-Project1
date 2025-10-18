@@ -36,6 +36,9 @@ import pretty_midi
 # pip install torchvggish
 from torchvggish import vggish, vggish_input
 
+from transformers import AutoFeatureExtractor, ASTModel
+import librosa
+from scipy.linalg import sqrtm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -61,11 +64,12 @@ CONFIG = {
     "stages_T": [128], # solo queremos el final
 
     # carpetas salida
-    "outdir": "eval_fad_hybrid",
-    "results_csv": "eval_fad_hybrid/fad_results.csv",
+    "outdir": "eval_fad_hybrid_Transformer",
+    "results_csv": "eval_fad_hybrid_Transformer/fad_results.csv",
 
     # pesos VGGish (None = aleatorios)
     "vggish_ckpt": "checkpoints/vggish-10086976.pth",
+    "ast_model_id": "MIT/ast-finetuned-audioset-10-10-0.4593",
 }
 
 
@@ -162,6 +166,16 @@ def load_vggish(device, ckpt_path=None, use_postprocess=True):
 
     return model
 
+def load_ast_model(model_id, device):
+    """
+    Carga el modelo Audio Spectrogram Transformer (AST) y su 
+    extractor de características desde Hugging Face.
+    """
+    logging.info(f"Cargando modelo AST: {model_id}")
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
+    model = ASTModel.from_pretrained(model_id).to(device).eval()
+    return model, feature_extractor
+
 # ============================
 # Embeddings y FAD
 # ============================
@@ -208,6 +222,54 @@ def extract_vggish_embeddings(wav_paths, device, model):
 
     return np.concatenate(embs, axis=0) if embs else np.zeros((0, 128), dtype=np.float32)
 
+@torch.no_grad()
+def extract_ast_embeddings(wav_paths, device, model, feature_extractor):
+    """
+    Retorna np.ndarray [N, 768] con embeddings AST.
+    - Lee cada WAV.
+    - Pre-procesa con el feature_extractor.
+    - Extrae el embedding promediando los hidden states.
+    """
+    model.eval().to(device)
+    embs = []
+    
+    # AST espera una frecuencia de muestreo de 16000, igual que VGGish
+    target_sr = feature_extractor.sampling_rate 
+
+    for wp in tqdm(wav_paths, desc="Embeddings (AST)", leave=False):
+        try:
+            # Carga la forma de onda del audio
+            waveform, sr = sf.read(str(wp))
+            
+            # Asegúrate de que el audio sea mono
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+
+            # Re-muestrea si es necesario (aunque ya generas a 16kHz)
+            if sr != target_sr:
+                # Necesitarás `pip install librosa` para esto
+                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr)
+
+            # Pre-procesa el audio para el modelo AST
+            # `return_tensors="pt"` devuelve tensores de PyTorch
+            inputs = feature_extractor(waveform, sampling_rate=target_sr, return_tensors="pt")
+            
+            # Mueve los datos al dispositivo correcto
+            input_values = inputs.input_values.to(device)
+
+            # Pasa los datos por el modelo
+            outputs = model(input_values)
+
+            # Obtenemos un embedding por clip promediando los "last_hidden_state"
+            # La salida de AST es [Batch, Time, EmbeddingDim], promediamos en el tiempo
+            embedding = outputs.last_hidden_state.mean(dim=1)
+            embs.append(embedding.cpu().numpy())
+
+        except Exception as e:
+            logging.warning(f"No se pudo procesar {wp}: {e}. Saltando...")
+            continue
+
+    return np.concatenate(embs, axis=0) if embs else np.zeros((0, 768), dtype=np.float32)
 
 def gaussian_stats(X):
     mu = np.mean(X, axis=0)
@@ -219,7 +281,6 @@ def frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """
     FID/FAD clásico entre Gaussinas N(mu1, sigma1) y N(mu2, sigma2).
     """
-    from scipy.linalg import sqrtm
     diff = mu1 - mu2
     covmean = sqrtm(sigma1.dot(sigma2) + np.eye(sigma1.shape[0]) * eps)
     if np.iscomplexobj(covmean):
@@ -313,7 +374,7 @@ def collect_audio_from_loader(
 # ============================
 # Pipeline FAD de un checkpoint
 # ============================
-def fad_for_checkpoint(T, device, vgg_model):
+def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     """
     Calcula FAD (global y por género) para T específico del currículo.
     Devuelve list[dict] con métricas.
@@ -389,8 +450,11 @@ def fad_for_checkpoint(T, device, vgg_model):
             logging.warning(f"[T={T}] Género {gid} ({name}) sin suficientes clips.")
             continue
 
-        r_emb = extract_vggish_embeddings(r_list, device, vgg_model)
-        f_emb = extract_vggish_embeddings(f_list, device, vgg_model)
+        # r_emb = extract_vggish_embeddings(r_list, device, vgg_model)
+        # f_emb = extract_vggish_embeddings(f_list, device, vgg_model)
+
+        r_emb = extract_ast_embeddings(r_list, device, ast_model, feature_extractor)
+        f_emb = extract_ast_embeddings(f_list, device, ast_model, feature_extractor)
 
         mu_r, sig_r = gaussian_stats(r_emb)
         mu_f, sig_f = gaussian_stats(f_emb)
@@ -409,8 +473,10 @@ def fad_for_checkpoint(T, device, vgg_model):
     all_real_sanity = sum((real_paths[g] for g in CONFIG["genres"].keys()), [])
     mid = len(all_real_sanity)//2
     A, B = all_real_sanity[:mid], all_real_sanity[mid:mid*2]
-    A_emb = extract_vggish_embeddings(A, device, vgg_model)
-    B_emb = extract_vggish_embeddings(B, device, vgg_model)
+    # A_emb = extract_vggish_embeddings(A, device, vgg_model)
+    # B_emb = extract_vggish_embeddings(B, device, vgg_model)
+    A_emb = extract_ast_embeddings(A, device, ast_model, feature_extractor)
+    B_emb = extract_ast_embeddings(B, device, ast_model, feature_extractor)
     muA, sigA = gaussian_stats(A_emb)
     muB, sigB = gaussian_stats(B_emb)
     fad_rr = frechet_distance(muA, sigA, muB, sigB)
@@ -447,13 +513,15 @@ def main():
     Path(CONFIG["outdir"]).mkdir(parents=True, exist_ok=True)
 
     # Inicializa VGGish UNA sola vez
-    vgg = load_vggish(device, ckpt_path=CONFIG.get("vggish_ckpt"), use_postprocess=False)
+    # vgg = load_vggish(device, ckpt_path=CONFIG.get("vggish_ckpt"), use_postprocess=False)
+    # Inicializa AST UNA sola vez
+    ast_model, feature_extractor = load_ast_model(CONFIG["ast_model_id"], device)
 
     all_rows = []
     for T in CONFIG["stages_T"]:
         logging.info(f"=== Evaluando FAD para T={T} ===")
         try:
-            rows = fad_for_checkpoint(T, device, vgg)
+            rows = fad_for_checkpoint(T, device, ast_model, feature_extractor)
             all_rows.extend(rows)
         except AssertionError as e:
             logging.warning(str(e))
