@@ -1,32 +1,82 @@
 # train_hybrid.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# (STAGE-3) Entrena el esquema híbrido CVAE + C-GAN
+# - Usa el split de TRAIN/VAL del data_pipeline (loader balanceado opcional).
+# - Carga una CVAE preentrenada (Stage-1) y la congela para extraer latentes z.
+# - Alterna entrenamiento:
+#     * Crítico (WGAN-GP): varias iteraciones por batch (critic_iters) con grad penalty.
+#     * Generador + CVAE: pérdida híbrida  L_hyb = α·ELBO_ponderado + γ·L_G.
+# - ELBO con MSE de reconstrucción + β·KL, ponderado por clase (class_weights).
+# - Teacher forcing activado en la CVAE para reconstrucción durante el entrenamiento.
+# - Cálculo de métricas por batch: L_D, L_G, ELBO, distancia de Wasserstein (W), GP, D_real/D_fake.
+# - Promedia métricas por época y registra logs legibles.
+# - Selección de mejor checkpoint por loss_G en validación; guarda también last por seguridad.
+# - Dispositivo auto-seleccionado (CUDA/MPS/CPU) y carpeta 'checkpoints/' gestionada automáticamente.
+# - Precaución con lotes de tamaño 1 (B=1): se omiten si el modelo no es robusto a '.squeeze()'/BatchNorm.
+#
+# Requisitos clave:
+# - 'checkpoints/cvae_pretrained_best.pth' (producido por train_cvae.py - Stage-1).
+# - data_pipeline con 'get_split_dataloader', 'collate_padded' y CSVs por split.
+#
+# Hiperparámetros (cfg/config):
+# - lambda_gp: peso del gradient penalty (WGAN-GP).
+# - critic_iters: n° de pasos del crítico por cada paso de G.
+# - beta: peso del término KL en ELBO.
+# - alpha, gamma: pesos de ELBO y L_G en la pérdida híbrida.
+#
+# Salida:
+# - 'checkpoints/generator_pretrained_best.pth' y 'critic_pretrained_best.pth' (mejores por Val loss_G).
+# - 'checkpoints/*_last.pth' con el último estado entrenado.
+# ============================================================
 
-import math
-import logging
-from pathlib import Path
-from collections import Counter
+import math # funciones matemáticas
+import logging # logging de información
+from pathlib import Path # manejo de rutas
+from collections import Counter # para conteo de etiquetas
 
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
+import torch # Para tensores
+import torch.nn.functional as F # Para funciones de activación y pérdidas
+from tqdm import tqdm # barra de progreso
 
-from data_pipeline import get_split_dataloader
-#from cvae import CVAE
-from cvae_seq2seq import CVAE
-from cgan import Generator, Critic, compute_gradient_penalty
+from data_pipeline import get_split_dataloader # Para cargar datos
+from cvae_seq2seq import CVAE # Modelo CVAE
+from cgan import Generator, Critic, compute_gradient_penalty # Cargamos modelos C-GAN y GP para la pérdida
 
+# Configuración básica de logging: timestamp + solo mensaje
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def as_long_labels(y):
+    """ Garantiza que las condiciones vienen como (B,1) o (B,)"""
     if y.ndim == 2 and y.size(-1) == 1:
         y = y.squeeze(-1)
     return y.long()
 
 def reconfigure_cvae_for_T(cvae: CVAE, new_T: int, device: torch.device):
-    """Ajusta el decoder del CVAE al nuevo seq_len (T)."""
-    cvae.seq_len = new_T # actualizar atributo (seq_len) de la CVAE, ya no necesitamos fc_dec ni reinstanciar todo el modelo
+    """
+    Ajusta el decoder del CVAE al nuevo seq_len (T).
+
+    Args:
+        cvae (CVAE): Instancia de CVAE a actualizar.
+        new_T (int): Nuevo valor de longitud de secuencia (frames).
+        device (torch.device): Dispositivo actual (no usado aquí, se mantiene por simetría)."""
+    cvae.seq_len = new_T # actualizar atributo (seq_len) de la CVAE
 
 def rebuild_gd_for_T(z_dim: int, cond_dim: int, new_T: int, device: torch.device):
-    """Crea nuevas instancias de G y D para un seq_len distinto."""
+    """
+    Crea nuevas instancias de G y D para un seq_len distinto.
+    Args:
+        z_dim (int): Dimensionalidad de la latente 'z'.
+        cond_dim (int): Número de clases de condición.
+        new_T (int): Longitud de secuencia destino (frames).
+        device (torch.device): Dispositivo al que enviar los modelos.
+
+    Returns:
+        tuple[nn.Module, nn.Module]: '(G_new, D_new)' reconstruidos en 'device'.
+    """
     G_new = Generator(z_dim=z_dim, cond_dim=cond_dim, seq_len=new_T).to(device)
     D_new = Critic(cond_dim=cond_dim, seq_len=new_T).to(device)
     return G_new, D_new
@@ -40,6 +90,7 @@ def transfer_matching_weights(src_model: torch.nn.Module, dst_model: torch.nn.Mo
     dst_model.load_state_dict(dst_sd, strict=False)
 
 def check_shapes_once(X, E, y, cvae, G, D, T, z_dim, cond_dim):
+    """ Cacheo de dimensiones en los tensores"""
     B, C, TT = X.shape
     assert C == 128, f"X debe ser (B,128,T); got (B,{C},{TT})"
     assert TT == T,  f"T del batch ({TT}) != seq_len esperado ({T})"
@@ -59,8 +110,29 @@ def check_shapes_once(X, E, y, cvae, G, D, T, z_dim, cond_dim):
         assert r_out.shape[0] == B and f_out.shape[0] == B, "Critic batch mismatch"
 
 def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights):
-    cvae.train(); G.train(); D.train()
-    opt_cvae, opt_g, opt_d = opts
+    """
+    Función para entrenar 1 época del modelo híbrido CVAE + C-GAN.
+    - Actualiza primero el Crítico (WGAN-GP) varias iteraciones por batch.
+    - Luego actualiza Generador (G) y CVAE con una pérdida compuesta:
+        L_hyb = α * ELBO_ponderado + γ * L_G
+
+    Args:
+        cvae: Modelo CVAE (provee reconstrucción y latentes z).
+        G: Generador condicional de la cGAN (produce X_fake a partir de z, y).
+        D: Crítico/Discriminador condicional (para WGAN-GP).
+        dataloader: Iterador de batches con claves {"piano_roll","events","conditions"}.
+        opts: Tupla de optimizadores (opt_cvae, opt_g, opt_d) en ese orden.
+        device: Dispositivo ('cuda'/'mps'/'cpu').
+        cfg (dict): Hiperparámetros (requiere: "critic_iters", "lambda_gp", "beta", "alpha", "gamma").
+        class_weights (torch.Tensor): Pesos por clase (longitud = n_clases) para ponderar ELBO.
+
+    Returns:
+        dict: Promedios por época de:
+            {"L_hyb","ELBO","L_G","L_D","D_real","D_fake","W","GP","steps"}
+            o 'None' si no hubo pasos válidos.
+    """
+    cvae.train(); G.train(); D.train() # Modo entrenamiento para los tres modelos
+    opt_cvae, opt_g, opt_d = opts # Desempaqueta optimizadores
 
     # Acumuladores por época
     total_hyb, total_elbo, total_lg, total_ld = 0.0, 0.0, 0.0, 0.0
@@ -68,10 +140,10 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
     n_steps = 0
 
     for batch in tqdm(dataloader, desc="Entrenando híbrido CVAE + C-GAN"):
-        X = batch["piano_roll"].to(device).float().contiguous()
-        E = batch["events"].to(device).float()
-        y = batch["conditions"].to(device)
-        y_flat = as_long_labels(y)
+        X = batch["piano_roll"].to(device).float().contiguous()  # (B,128,T) reales
+        E = batch["events"].to(device).float() # (B,N,3)
+        y = batch["conditions"].to(device) # (B,1)
+        y_flat = as_long_labels(y) # (B,) normaliza condición para indexar pesos
 
         # Evitar batch=1 (por cgan.py 'squeeze()' sin eje)
         if X.size(0) == 1:
@@ -81,21 +153,25 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
         for _ in range(cfg["critic_iters"]):
             opt_d.zero_grad()
 
+            # Congelamos CVAE y G aquí: solo queremos actualizar D
             with torch.no_grad():
-                mu, logvar = cvae.encoder(X, E, y)
-                z = cvae.reparameterize(mu, logvar)
-                X_fake = G(z, y).detach()
+                mu, logvar = cvae.encoder(X, E, y) # parámetros q(z|X,E,y)
+                z = cvae.reparameterize(mu, logvar) # muestreo latente
+                X_fake = G(z, y).detach() # fakes (no grad a G)
 
-            real_out = D(X, y).squeeze(1)
-            fake_out = D(X_fake, y).squeeze(1)
+            real_out = D(X, y).squeeze(1) # D(x_real, y)
+            fake_out = D(X_fake, y).squeeze(1) # D(x_fake, y)
 
+            # Penalización de gradiente para imponer ||∇_x D||->1
             gp = compute_gradient_penalty(lambda t: D(t, y), X.detach(), X_fake.detach(), device)
+
+            # L_D = E[D(fake)] - E[D(real)] + lambda*GP  (equivalente a -Wdist + lambda*GP)
             loss_d = -torch.mean(real_out) + torch.mean(fake_out) + cfg["lambda_gp"] * gp
             loss_d.backward()
-            torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0) # clip defensivo
             opt_d.step()
 
-            # métricas critic (última iter de critic en este batch será la “visible”)
+            # Métricas del crítico (de la última iter de critic en este batch)
             D_real = real_out.mean().item()
             D_fake = fake_out.mean().item()
             Wdist  = D_real - D_fake
@@ -105,24 +181,26 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
         opt_g.zero_grad()
         opt_cvae.zero_grad()
 
-        # ELBO (MSE) con ponderación por clase
-        X_rec, mu, logvar = cvae(X, E, y, teacher_prob=1.0)
-        recon = F.mse_loss(X_rec, X, reduction='none').sum(dim=(1,2))
-        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
+        # ELBO (MSE) con ponderación por clase: recon + β * KL, ponderado por w[y]
+        X_rec, mu, logvar = cvae(X, E, y, teacher_prob=1.0) # reconstrucción con teacher forcing
+        recon = F.mse_loss(X_rec, X, reduction='none').sum(dim=(1,2)) # ||X-X_rec||^2 por muestra
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1) # KL(q||p) por muestra
 
-        w = class_weights[y_flat]
-        elbo = (w * (recon + cfg["beta"] * kl)).mean()
+        w = class_weights[y_flat] # peso por clase para cada muestra
+        elbo = (w * (recon + cfg["beta"] * kl)).mean() # promedio ponderado
 
+        # Componente adversaria para G (y CVAE vía z): L_G = -E[D(G(z),y)]
         with torch.no_grad():
-            z = cvae.reparameterize(mu, logvar)
+            z = cvae.reparameterize(mu, logvar) # latentes (sin grad a encoder)
         X_fake = G(z, y)
         g_out = D(X_fake, y).squeeze(1)
         loss_g = -torch.mean(g_out)
 
+        # Pérdida híbrida total: α*ELBO + γ*L_G
         loss_hyb = cfg["alpha"] * elbo + cfg["gamma"] * loss_g
         loss_hyb.backward()
-        torch.nn.utils.clip_grad_norm_(cvae.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(cvae.parameters(), 1.0) # clips defensivos
+        torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0) # clips defensivos
         opt_g.step()
         opt_cvae.step()
 
@@ -137,7 +215,7 @@ def train_hybrid_epoch(cvae, G, D, dataloader, opts, device, cfg, class_weights)
         total_GP += GP
         n_steps += 1
 
-        # checks simples (opcionales)
+        # checks simples (heurística para detectar posible colapso/estancamiento)
         if abs(Wdist) < 0.05 and loss_g.item() < 0.01:
             logging.debug("Posible estancamiento: |W|->0 y loss_g->0 en este batch.")
 
@@ -231,7 +309,7 @@ def main():
 
     # --- config ---
     curriculum = [32, 64, 128]   # seq_len reales por etapa
-    epochs_per = [10, 10, 10]       # ajusta a gusto
+    epochs_per = [10, 10, 15]       # ajusta a gusto, dejar más épocas el de 128
 
     z_dim = 32
     cond_dim = 4
@@ -264,7 +342,7 @@ def main():
         hidden_dim=32
     ).to(device)
 
-    # Carga preentrenos (si existen)
+    # Carga preentrenos (deben existir)
     ckpt_cvae = Path("checkpoints/cvae_pretrained_best.pth")
     if ckpt_cvae.exists():
         cvae.load_state_dict(torch.load(ckpt_cvae, map_location=device))

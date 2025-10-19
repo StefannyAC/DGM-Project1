@@ -1,26 +1,57 @@
 # cgan.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# CGAN condicional por género musical compatible con data_pipeline.py
+# usando WGAN-GP (critic en lugar de discriminator)
+# - z: (B, z_dim), vector latente de entrada al generador.
+# - cond: (B, 1) o (B,) Long (id de género en {0..3}), condición de género.
+# - G(z, cond): genera secuencias tipo piano-roll (B, 128, T) en rango [0,1].
+# - D(x, cond): crítico condicional que evalúa la autenticidad de una secuencia
+#               dado su género, produciendo un escalar (score real/fake).
+# - compute_gradient_penalty(): regularizador de Lipschitz usado en WGAN-GP.
+# ============================================================
+ 
+import torch # Para tensores
+import torch.nn as nn # Para definir modelos
+import torch.nn.functional as F # Para funciones de activación y pérdidas
 
 # ------------------------------------------------------------
 # Helper function
 # ------------------------------------------------------------
 def compute_gradient_penalty(critic_fn, real_samples, fake_samples, device):
-    alpha = torch.rand(real_samples.size(0), 1, 1, device=device)
-    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
-    critic_interpolates = critic_fn(interpolates)
+    """
+    Función para calcular el Gradient Penalty (WGAN-GP) sobre muestras interpoladas
+    entre reales y generadas, forzando que ||∇_x D(x)||₂ -> 1.
+
+    Args:
+        critic_fn: Función que evalúa el Crítico D(x) y devuelve un tensor escalar por muestra (shape (B, 1) o (B,)).
+        real_samples: Tensores reales x_real con shape (B, ...).
+        fake_samples: Tensores generados x_fake con shape (B, ...).
+        device: Dispositivo donde crear 'alpha' y realizar el cálculo.
+
+    Returns:
+        Escalar (0-D) con el valor medio del término de penalización:
+            E[(||∇_x D(x_hat)||₂ - 1)²], donde x_hat = α x_real + (1-α) x_fake.
+    """
+    alpha = torch.rand(real_samples.size(0), 1, 1, device=device) # (B,1,1) para broadcast en todas las dims
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)  # x_hat con grad
+    critic_interpolates = critic_fn(interpolates) # D(x_hat): salida por muestra (B,1) o (B,)
+
+    # ∇_{x_hat} D(x_hat) usando autograd:
+    # - grad_outputs: tensor de unos con misma forma que la salida para propagar dL/dD = 1
     gradients = torch.autograd.grad(
         outputs=critic_interpolates,
         inputs=interpolates,
         grad_outputs=torch.ones_like(critic_interpolates),
-        create_graph=True,
+        create_graph=True, # conserva el grafo para seguir backward en este resultado
         retain_graph=True,
-        only_inputs=True,
+        only_inputs=True, # solo calcula grad respecto a 'interpolates'
     )[0]
-    gradients = gradients.view(gradients.size(0), -1)
-    return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    gradients = gradients.view(gradients.size(0), -1) # aplanar por muestra -> (B, num_feats)
+    return ((gradients.norm(2, dim=1) - 1) ** 2).mean() # E[(||g||₂ - 1)^2]
 
 # ------------------------------------------------------------
 # Generator: G(z, cond)
