@@ -7,3 +7,7 @@ mido
 torchvggish
 soundfile
 fluidsynth ---> se recomienda instalar con https://chocolatey.org/install como choco install fluidsynth
+transformer
+numpy
+librosa
+scipy
