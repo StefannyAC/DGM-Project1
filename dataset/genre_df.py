@@ -1,4 +1,11 @@
-
+# genre_df.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Este script usa getters de msongsdb para extraer la metadata de la base de datos. Usarlo solo si se requiere recrear un nuevo dataframe.
+# ============================================================
 import os
 import glob
 from typing import List

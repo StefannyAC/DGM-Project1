@@ -1,3 +1,11 @@
+# prepare_midi_dataset.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Extrae artista título y path del archivo midi. No usar salvo se necesite reconstruir el dataset.
+# ============================================================
 import os
 import glob
 

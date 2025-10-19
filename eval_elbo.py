@@ -1,27 +1,42 @@
 # eval_elbo.py
-import logging
-from pathlib import Path
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda con asistencia de ChatGPT
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Este script calcula el ELBO sobre el conjunto de datos de test después de tener un modelo entrenado.
+# ============================================================
+import logging # logging de información
+from pathlib import Path # manejo de rutas
+import numpy as np # manejo de arrays
+import pandas as pd # manejo de dataframes
+from tqdm import tqdm # barra de progreso
 
-import torch
-import torch.nn.functional as F
+import torch # Para tensores
+import torch.nn.functional as F # Para funciones de activación y pérdidas
 
-from data_pipeline import get_split_dataloader
-from cvae_seq2seq import CVAE
-# No necesitamos el Generador (CGAN) para evaluar el ELBO del CVAE
-# from cgan import Generator 
+from data_pipeline import get_split_dataloader # función para obtener el split correcto 
+from cvae_seq2seq import CVAE # clase CVAE 
 
+# Configuración básica de logging: timestamp + solo mensaje
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 @torch.no_grad()
 def elbo_on_loader(cvae, loader, device, beta=1.0):
     """
-    Calcula el ELBO (Evidence Lower Bound) sobre el conjunto de datos.
-    ELBO = Reconstrucción - KL_Divergencia
+    Función que calcula el ELBO (Evidence Lower Bound) sobre el conjunto de datos.
+    ELBO = Reconstrucción - beta*KL_Divergencia
     Aquí reportamos el ELBO (maximizar) y sus componentes por separado.
-    Usamos BCE como la log-verosimilitud de reconstrucción.
+    Usamos MSE como la log-verosimilitud de reconstrucción.
+
+    Args:
+        cvae: CVAE entrenada del modelo híbrido (si se quiere usar para probar la cvae pre-entrenada cambiar la pérdida de reconstrucción por BCE)
+        loader: dataloader que va a cargar los datos de test
+        device: 'cuda' , 'mlp', o 'cpu'
+        beta: parámetro de regularización de KL 
+
+    Returns:
+        dict: Con los valores de Reconstrucción, KL y ELBO promedios obtenidos por género y en total. 
     """
     cvae.eval()
     # Usaremos diccionarios para guardar los 3 componentes
@@ -42,18 +57,17 @@ def elbo_on_loader(cvae, loader, device, beta=1.0):
 
         # --- Cálculo de los componentes del ELBO ---
 
-        # 1. Pérdida de Reconstrucción (BCE)
-        # Usamos BCE porque la salida son probabilidades (piano roll 0-1)
+        # Pérdida de Reconstrucción (BCE)
         # Lo calculamos por muestra (sumando sobre las dimensiones del piano roll)
         recon_loss = F.mse_loss(X_recon, X, reduction='none').sum(dim=(1, 2))
 
-        # 2. Divergencia KL
+        # Divergencia KL
         # Fórmula estándar para D_KL(N(mu, sigma) || N(0, I))
         # Lo calculamos por muestra (sumando sobre la dimensión latente)
         kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
-        # 3. ELBO
-        # El loss de VAE es (Recon + KL). El ELBO es el negativo de eso.
+        # ELBO
+        # El loss de VAE es (Recon + beta*KL). El ELBO es el negativo de eso.
         # Queremos maximizar el ELBO (o minimizar su negativo).
         elbo = -(recon_loss + beta*kl_div)
 
@@ -96,9 +110,9 @@ def elbo_on_loader(cvae, loader, device, beta=1.0):
 
 def main():
     # --- config ---
-    # Asegúrate de que T coincida con el checkpoint que quieres evaluar
-    T = 32 
-    batch_size = 128
+    # Aseguramos que T coincida con el checkpoint que quieres evaluar
+    T = 128 # Pues el último modelo del híbrido tiene secuencias de 128 
+    batch_size = 128 # Ajustar a conveniencia
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     print(f"Device: {device}")
 

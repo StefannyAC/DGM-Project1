@@ -1,3 +1,11 @@
+# hubconf.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Este archivo permite cargar modelos preentrenados desde PyTorch Hub
+# ------------------------------------------------------------
 import torch
 
 

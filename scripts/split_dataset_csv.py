@@ -1,3 +1,11 @@
+# split_dataset_csv.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Este script crea splits de entrenamiento, validacion y prueba y guardar los csv con los datos para reproducibilidad. No es necesario volverlo a ejecutar.
+# ============================================================
 import os
 
 import pandas as  pd

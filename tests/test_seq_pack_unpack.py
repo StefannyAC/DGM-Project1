@@ -1,3 +1,13 @@
+# test_seq_pack_unpack.py
+# ============================================================
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Este script prueba las funciones de empaquetado y desempaquetado
+# de matrices tipo piano-roll para asegurar que son inversas una de la otra. 
+# Es un script simple que genera matrices aleatorias, las empaqueta y luego las desempaqueta, no usarlo pues no es parte del flujo principal del proyecto.
+# ============================================================
 import numpy as np
 from tqdm import tqdm
 

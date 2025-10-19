@@ -1,6 +1,10 @@
 # eval_fad.py
 # ============================================================
-# Evalúa FAD (Frechet Audio Distance) por género y global
+# Realizado por: Emmanuel Larralde y Stefanny Arboleda con asistencia de ChatGPT
+# Proyecto # 1 - Modelos Generativos Profundos 
+# Artículo base: "Design of an Improved Model for Music Sequence Generation Using Conditional Variational Autoencoder and Conditional GAN"
+# ============================================================
+# Evalúa FAD (Frechet Audio Distance) por género y global en muestras de latentes aleatorias
 # a partir de checkpoints del modelo híbrido (CVAE + Generator).
 # - Usa el split de TEST del data_pipeline
 # - Selecciona automáticamente "best" y si no existe cae a "last"
@@ -8,47 +12,43 @@
 # - Extrae embeddings con VGGish y calcula FAD
 # ============================================================
 
-import os
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-os.environ.setdefault("FLUIDSYNTH_AUDIO_DRIVER", "wasapi")
-import math
-import json
-import time
-import shutil
-import logging
-from pathlib import Path
-from collections import defaultdict, Counter
+import os # para manejo de rutas
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy") # desactiva salida de audio real
+os.environ.setdefault("FLUIDSYNTH_AUDIO_DRIVER", "wasapi") # define driver de audio Fluidsynth
+import math # funciones matemáticas
+import json # manejo de JSON
+import time # medir tiempos
+import shutil # operaciones con archivos y carpetas
+import logging # logging de información
+from pathlib import Path # manejo de rutas
+from collections import defaultdict, Counter # conteo y agrupación de elementos
 
-import numpy as np
-import pandas as pd
-import soundfile as sf
+import numpy as np # manejo de arrays
+import pandas as pd # manejo de dataframes
+import soundfile as sf # lectura y escritura de archivos de audio
 
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
+import torch # Para Tensores
+import torch.nn.functional as F # Para funciones de activación y pérdidas
+from tqdm import tqdm # barra de progreso
 
-from data_pipeline import get_split_dataloader
-from cvae_seq2seq import CVAE
-from cgan import Generator
-import pretty_midi
+from data_pipeline import get_split_dataloader # Para cargar datos
+from cvae_seq2seq import CVAE # Modelo CVAE
+from cgan import Generator # Generador del C-GAN
+import pretty_midi # procesamiento de MIDI 
 
-# --- VGGish ---
-# pip install torchvggish
-from torchvggish import vggish, vggish_input
+from transformers import AutoFeatureExtractor, ASTModel # modelo AST preentrenado
+import librosa # análisis y carga de audio
+from scipy.linalg import sqrtm # raíz matricial (FID, métricas)
 
-from transformers import AutoFeatureExtractor, ASTModel
-import librosa
-from scipy.linalg import sqrtm
-
+# Configuración básica de logging: timestamp + solo mensaje
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 
 # ============================
 # Config
 # ============================
 CONFIG = {
     # audio render
-    "sample_rate": 16000,   # VGGish requiere 16 kHz
+    "sample_rate": 16000,   # AST requiere 16 kHz
     "fs_pr": 16,            # frames/s del piano-roll (de data_pipeline)
 
     # evaluación
@@ -67,8 +67,7 @@ CONFIG = {
     "outdir": "eval_fad_hybrid_samples_Transformer",
     "results_csv": "eval_fad_hybrid_samples_Transformer/fad_results.csv",
 
-    # pesos VGGish (None = aleatorios)
-    "vggish_ckpt": "checkpoints/vggish-10086976.pth",
+    # pesos del transformer
     "ast_model_id": "MIT/ast-finetuned-audioset-10-10-0.4593",
 }
 
@@ -78,162 +77,119 @@ CONFIG = {
 # ============================
 def pianoroll_to_pretty_midi(X_bin, fs=16, program=0, velocity=80, min_dur_frames=1):
     """
-    X_bin: (128, T) binaria {0,1}
-    Devuelve pretty_midi.PrettyMIDI.
-    """
-    pm = pretty_midi.PrettyMIDI()
-    inst = pretty_midi.Instrument(program=program)
-    T = X_bin.shape[1]
+    Función que convierte una matriz binaria de piano-roll en un objeto PrettyMIDI.
 
-    for pitch in range(128):
-        pr = X_bin[pitch]
-        on = None
-        for t in range(T):
-            if pr[t] == 1 and on is None:
-                on = t
-            if (on is not None) and (pr[t] == 0):
-                dur = t - on
-                if dur >= min_dur_frames:
-                    start = on / fs
-                    end   = t / fs
-                    inst.notes.append(pretty_midi.Note(velocity=velocity, pitch=pitch, start=start, end=end))
-                on = None
-        if on is not None:
-            dur = T - on
-            if dur >= min_dur_frames:
-                start = on / fs
-                end   = T / fs
+    Args:
+        X_bin: Matriz binaria de tamaño (128, T). Los valores son {0,1}.
+        fs: Frecuencia temporal (frames por segundo) del piano-roll.
+        program: Número del instrumento MIDI (0 = piano acústico).
+        velocity: Intensidad (0-127) de las notas MIDI generadas.
+        min_dur_frames: Duración mínima (en frames) para considerar una nota válida.
+
+    Returns:
+        pretty_midi.PrettyMIDI: Objeto PrettyMIDI que contiene el instrumento y sus notas.
+    """
+    pm = pretty_midi.PrettyMIDI() # crea objeto MIDI vacío
+    inst = pretty_midi.Instrument(program=program) # crea instrumento con el número de programa indicado
+    T = X_bin.shape[1] # número total de frames temporales
+
+    for pitch in range(128): # recorre todos los tonos MIDI posibles
+        pr = X_bin[pitch] # obtiene la fila correspondiente a este tono
+        on = None # marcador de inicio de nota (None = no activa)
+        for t in range(T): # recorre el tiempo frame a frame
+            if pr[t] == 1 and on is None: # si empieza una nota (paso 0->1)
+                on = t # guarda el frame de inicio
+            if (on is not None) and (pr[t] == 0): # si termina una nota (paso 1->0)
+                dur = t - on # calcula duración en frames
+                if dur >= min_dur_frames: # descarta notas demasiado cortas
+                    start = on / fs # tiempo inicial en segundos
+                    end   = t / fs # tiempo final en segundos
+                    inst.notes.append(pretty_midi.Note(velocity=velocity, pitch=pitch, start=start, end=end)) # intensidad, tono, inicio, fin 
+                on = None  # resetea marcador de inicio
+        if on is not None: # si queda una nota abierta hasta el final
+            dur = T - on # calcula duración restante
+            if dur >= min_dur_frames: # verifica duración mínima
+                start = on / fs # inicio en segundos
+                end   = T / fs # fin en segundos (último frame)
                 inst.notes.append(pretty_midi.Note(velocity=velocity, pitch=pitch, start=start, end=end))
 
-    pm.instruments.append(inst)
-    return pm
-
-from contextlib import contextmanager
+    pm.instruments.append(inst) # añade el instrumento al objeto MIDI
+    return pm # devuelve el objeto PrettyMIDI final
 
 @contextmanager
 def suppress_stderr():
-    devnull = open(os.devnull, 'w')
-    old_stderr_fd = os.dup(2)  # 2 = stderr
+    """
+    Contexto para suprimir temporalmente los mensajes de error (stderr).
+    """
+    devnull = open(os.devnull, 'w') # abre /dev/null para desechar salida
+    old_stderr_fd = os.dup(2)  # duplica descriptor de stderr (2)
     try:
-        os.dup2(devnull.fileno(), 2)
-        yield
+        os.dup2(devnull.fileno(), 2) # redirige stderr a /dev/null
+        yield # ejecuta el bloque dentro del contexto
     finally:
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stderr_fd)
-        devnull.close()
+        os.dup2(old_stderr_fd, 2) # restaura stderr original
+        os.close(old_stderr_fd) # cierra descriptor temporal
+        devnull.close() # cierra /dev/null
 
 def render_midi_to_wav(pm: pretty_midi.PrettyMIDI, wav_path: Path, sr: int = 16000):
     """
-    Render sencillo vía pretty_midi.fluidsynth (usa Fluidsynth instalado en el sistema).
-    Salida mono 16 kHz.
+    Renderiza un objeto PrettyMIDI a un archivo WAV.
+
+    Args:
+        pm: Objeto MIDI a convertir.
+        wav_path: Ruta donde se guardará el archivo WAV.
+        sr: Frecuencia de muestreo del audio de salida (por defecto 16 kHz).
+
+    Returns:
+        None (genera archivo WAV en disco).
     """
-    audio = pm.fluidsynth(fs=sr)
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    sf.write(str(wav_path), audio, sr)
-
-def load_vggish(device, ckpt_path=None, use_postprocess=True):
-    """
-    Carga el modelo VGGish y se asegura de que TODOS sus componentes
-    (incluyendo los tensores PCA no registrados) estén en el dispositivo correcto.
-    """
-    model = vggish()
-    model.postprocess = use_postprocess  # True para usar PCA
-
-    if ckpt_path:
-        if Path(ckpt_path).is_file():
-            state = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(state)
-        else:
-            logging.warning(f"No se encontró el checkpoint VGGish en: {ckpt_path}. "
-                            "Se usarán pesos aleatorios (métricas poco fiables).")
-    else:
-        logging.warning("Sin checkpoint de VGGish: usando pesos aleatorios.")
-
-    # Mueve el modelo completo al dispositivo
-    model.to(device)
-
-    # --- INICIO DE LA CORRECCIÓN CLAVE ---
-    # Forzamos manualmente el movimiento de los tensores PCA al dispositivo correcto,
-    # ya que no están registrados correctamente en el módulo y .to(device) los ignora.
-    # --- MUY IMPORTANTE: mover PCA al mismo device ---
-    if getattr(model, "pproc", None) is not None:
-        if hasattr(model.pproc, "_pca_matrix"):
-            model.pproc._pca_matrix = model.pproc._pca_matrix.to(device)
-        if hasattr(model.pproc, "_pca_means"):
-            model.pproc._pca_means = model.pproc._pca_means.to(device)
-    # --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    return model
+    audio = pm.fluidsynth(fs=sr) # sintetiza audio a partir del MIDI usando fluidsynth
+    if audio.ndim == 2: # si es estéreo
+        audio = audio.mean(axis=1) # convierte a mono promediando canales
+    sf.write(str(wav_path), audio, sr) # guarda el audio en disco
 
 def load_ast_model(model_id, device):
     """
-    Carga el modelo Audio Spectrogram Transformer (AST) y su 
-    extractor de características desde Hugging Face.
+    Carga el modelo AST (Audio Spectrogram Transformer) desde Hugging Face.
+
+    Args:
+        model_id: Nombre o ruta del modelo en Hugging Face.
+        device: Dispositivo donde cargar el modelo.
+
+    Returns:
+        tuple: (modelo AST, extractor de características).
     """
-    logging.info(f"Cargando modelo AST: {model_id}")
-    feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
-    model = ASTModel.from_pretrained(model_id).to(device).eval()
-    return model, feature_extractor
+    logging.info(f"Cargando modelo AST: {model_id}") # registro del modelo cargado
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_id) # carga extractor
+    model = ASTModel.from_pretrained(model_id).to(device).eval() # carga modelo y mueve a dispositivo
+    return model, feature_extractor # retorna ambos
 
 # ============================
 # Embeddings y FAD
 # ============================
 @torch.no_grad()
-def extract_vggish_embeddings(wav_paths, device, model):
-    """
-    Retorna np.ndarray [N, 128] con embeddings VGGish.
-    Soporta que vggish_input.wavfile_to_examples devuelva np.ndarray o torch.Tensor
-    con diferentes dimensiones.
-    """
-    model.eval().to(device)
-    embs = []
-
-    for wp in tqdm(wav_paths, desc="Embeddings (VGGish)", leave=False):
-        ex = vggish_input.wavfile_to_examples(str(wp))  # Puede ser [N,96,64], [N,1,96,64], etc.
-
-        # --- INICIO DE LA CORRECCIÓN ---
-
-        # 1. Convertir a Tensor de PyTorch si es necesario
-        if not isinstance(ex, torch.Tensor):
-            ex = torch.from_numpy(np.asarray(ex, dtype=np.float32))
-
-        # 2. Asegurar que el tensor tenga 4 dimensiones [B, C, H, W]
-        if ex.ndim == 2:  # Caso: [H, W] -> [96, 64]
-            ex = ex.unsqueeze(0).unsqueeze(0)  # -> [1, 1, 96, 64]
-        elif ex.ndim == 3:  # Caso: [B, H, W] -> [N, 96, 64]
-            ex = ex.unsqueeze(1)  # -> [N, 1, 96, 64]
-        
-        # Si ex.ndim ya es 4, asumimos que tiene la forma correcta [N, 1, 96, 64] y no hacemos nada.
-        # Si tiene 5 dimensiones o más, es un caso inesperado, pero esta lógica evita añadir más.
-
-        x = ex.to(device).float()
-
-        # --- FIN DE LA CORRECCIÓN ---
-
-        if x.shape[0] == 0:
-            # audio demasiado corto → clip silencioso
-            # Usamos el mismo device y dtype para evitar errores de compatibilidad
-            x = torch.zeros(1, 1, 96, 64, device=device, dtype=torch.float32)
-
-        z = model(x)                          # [N, 128]
-        z = z.mean(dim=0, keepdim=True)     # promedio por clip
-        embs.append(z.cpu().numpy())
-
-    return np.concatenate(embs, axis=0) if embs else np.zeros((0, 128), dtype=np.float32)
-
-@torch.no_grad()
 def extract_ast_embeddings(wav_paths, device, model, feature_extractor):
     """
-    Retorna np.ndarray [N, 768] con embeddings AST.
-    - Lee cada WAV.
-    - Pre-procesa con el feature_extractor.
-    - Extrae el embedding promediando los hidden states.
+    Extrae embeddings del modelo AST (Audio Spectrogram Transformer) a partir de archivos WAV.
+
+    Args:
+        wav_paths: Lista de rutas a los archivos WAV de entrada.
+        device: Dispositivo donde correr el modelo.
+        model (ASTModel): Modelo preentrenado de Audio Spectrogram Transformer.
+        feature_extractor (AutoFeatureExtractor): Extractor de características de Hugging Face.
+
+    Returns:
+        Array de tamaño [N, 768] con un embedding promedio por archivo.
+
+    Detalles:
+        - Cada audio se carga, convierte a mono y se remuestrea (si es necesario) a 16 kHz.
+        - El modelo AST genera una secuencia de embeddings temporales que se promedian en el eje temporal.
+        - Si algún archivo falla, se omite con advertencia en el log.
     """
-    model.eval().to(device)
-    embs = []
+    model.eval().to(device) # asegura modo evaluación y mueve a dispositivo
+    embs = [] # lista para guardar los embeddings
     
-    # AST espera una frecuencia de muestreo de 16000, igual que VGGish
+    # AST espera una frecuencia de muestreo de 16000
     target_sr = feature_extractor.sampling_rate 
 
     for wp in tqdm(wav_paths, desc="Embeddings (AST)", leave=False):
@@ -241,17 +197,17 @@ def extract_ast_embeddings(wav_paths, device, model, feature_extractor):
             # Carga la forma de onda del audio
             waveform, sr = sf.read(str(wp))
             
-            # Asegúrate de que el audio sea mono
+            # Aseguiramos que el audio sea mono
             if waveform.ndim > 1:
                 waveform = waveform.mean(axis=1)
 
-            # Re-muestrea si es necesario (aunque ya generas a 16kHz)
+            # Re-muestrea si es necesario (aunque ya generamos a 16kHz)
             if sr != target_sr:
-                # Necesitarás `pip install librosa` para esto
+                # IMPORTANTE: Se necesita 'pip install librosa' para esto
                 waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr)
 
             # Pre-procesa el audio para el modelo AST
-            # `return_tensors="pt"` devuelve tensores de PyTorch
+            # 'return_tensors="pt"' devuelve tensores de PyTorch
             inputs = feature_extractor(waveform, sampling_rate=target_sr, return_tensors="pt")
             
             # Mueve los datos al dispositivo correcto
@@ -263,15 +219,27 @@ def extract_ast_embeddings(wav_paths, device, model, feature_extractor):
             # Obtenemos un embedding por clip promediando los "last_hidden_state"
             # La salida de AST es [Batch, Time, EmbeddingDim], promediamos en el tiempo
             embedding = outputs.last_hidden_state.mean(dim=1)
-            embs.append(embedding.cpu().numpy())
+            embs.append(embedding.cpu().numpy()) # guarda embedding en CPU
 
         except Exception as e:
-            logging.warning(f"No se pudo procesar {wp}: {e}. Saltando...")
+            logging.warning(f"No se pudo procesar {wp}: {e}. Saltando...") # mensaje si falla un archivo
             continue
-
+    
+    # concatena todos los embeddings o devuelve array vacío si no hay válidos
     return np.concatenate(embs, axis=0) if embs else np.zeros((0, 768), dtype=np.float32)
 
 def gaussian_stats(X):
+    """
+    Calcula la media y covarianza de un conjunto de embeddings.
+
+    Args:
+        X: Matriz de tamaño [N, D], donde N son muestras y D la dimensión de los embeddings.
+
+    Returns:
+        tuple: (mu, sigma)
+            - mu: Vector medio de tamaño [D].
+            - sigma: Matriz de covarianza [D, D].
+    """
     mu = np.mean(X, axis=0)
     sigma = np.cov(X, rowvar=False)
     return mu, sigma
@@ -279,26 +247,53 @@ def gaussian_stats(X):
 
 def frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """
-    FID/FAD clásico entre Gaussinas N(mu1, sigma1) y N(mu2, sigma2).
-    """
-    diff = mu1 - mu2
-    covmean = sqrtm(sigma1.dot(sigma2) + np.eye(sigma1.shape[0]) * eps)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-    return abs(float(fid))
+    Calcula la Frechet Distance (FID/FAD) entre dos distribuciones gaussianas.
 
+    Args:
+        mu1: Media del primer conjunto de embeddings.
+        sigma1: Covarianza del primer conjunto.
+        mu2: Media del segundo conjunto.
+        sigma2: Covarianza del segundo conjunto.
+        eps: Pequeño valor para estabilizar la raíz matricial.
+
+    Returns:
+        Valor escalar del Frechet Distance.
+
+    Detalles:
+        - Mide la similitud entre dos distribuciones gaussianas.
+        - Utilizado en métricas como FAD (Frechet Audio Distance).
+    """
+    diff = mu1 - mu2 # diferencia entre medias
+    covmean = sqrtm(sigma1.dot(sigma2) + np.eye(sigma1.shape[0]) * eps) # raíz de producto de covarianzas
+    if np.iscomplexobj(covmean): # elimina posibles valores imaginarios
+        covmean = covmean.real
+    fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)  # fórmula FAD
+    return abs(float(fid)) # retorna valor escalar absoluto
 
 # ============================
 # Helpers de checkpoints
 # ============================
 def _pick_ckpt(best_path, last_path):
+    """
+    Selecciona el checkpoint disponible entre los archivos 'best' y 'last'.
+
+    Args:
+        best_path: Ruta al checkpoint con mejor desempeño.
+        last_path: Ruta al último checkpoint guardado.
+
+    Returns:
+        str: Ruta del checkpoint existente o None si no se encuentra ninguno.
+
+    Detalles:
+        - Verifica primero si existe el checkpoint "best".
+        - Si no, intenta usar el "last".
+        - Si ninguno existe, retorna None.
+    """
     if Path(best_path).is_file():
         return best_path
     if Path(last_path).is_file():
         return last_path
     return None
-
 
 # ============================
 # Recolección de audio
@@ -308,13 +303,29 @@ def collect_audio_from_loader(
     fs_pr=16, min_dur_frames=1, velocity=80, program=0, mode="real", min_notes_threshold=5,seed=None
 ):
     """
-    Genera WAVs por género desde el dataloader.
-    - mode="real": usa X (ground-truth) para MIDI->WAV.
-    - mode="fake": z = encoder(X,E,y)-> G(z,y); umbraliza y sintetiza.
-    Devuelve: dict {genre_id: [wav_paths...]}
+    Genera clips WAV por género a partir del dataloader.
+
+    Args:
+        dataloader: DataLoader con batches que contienen piano_roll, events y conditions.
+        cvae: Modelo CVAE con encoder y método reparameterize.
+        gen: Generador que produce piano rolls a partir de (z, y).
+        device: Dispositivo ('cuda', 'mps', 'cpu').
+        outdir: Carpeta de salida donde guardar los WAVs.
+        per_genre: Número máximo de clips por género a recolectar.
+        threshold: Umbral binario para convertir activaciones [0,1] a notas activas.
+        fs_pr: Frecuencia de muestreo del piano roll.
+        min_dur_frames: Duración mínima (en frames) de una nota.
+        velocity: Velocidad MIDI asignada a cada nota.
+        program: Programa/instrumento MIDI (0 = piano).
+        mode: "real" usa los datos ground-truth, "fake" usa muestras generadas.
+        min_notes_threshold: Mínimo de notas para aceptar un clip (evita clips vacíos).
+        seed: semilla para reproducibilidad del espacio latente generado aleatoriamente.
+
+    Returns:
+        dict: Diccionario {genre_id: [rutas_a_wavs]}.
     """
     if seed is not None:
-        torch.manual_seed(seed); np.random.seed(seed)
+        torch.manual_seed(seed); np.random.seed(seed) # sincronizamos
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -329,48 +340,45 @@ def collect_audio_from_loader(
 
         if mode == "fake":
             with torch.no_grad():
-                z = torch.randn(B, cvae.z_dim, device=device)
-                Xg = gen(z, y)                       # (B,128,T), [0,1]
+                z = torch.randn(B, cvae.z_dim, device=device) # construimos una z aleatoria
+                Xg = gen(z, y)                       # (B,128,T), [0,1]; usamos el generador para crear una secuencia de ese z
                 Xb = (Xg >= threshold).float()
         else:
-            Xb = (X >= threshold).float()
+            Xb = (X >= threshold).float() # si no es fake evalúa el z real que ya viene de la cvae
 
         Xb_np = Xb.cpu().numpy()
         y_np = y.squeeze(-1).cpu().numpy()
 
         for i in range(B):
             gid = int(y_np[i])
-            if per_genre_count[gid] >= per_genre:
+            if per_genre_count[gid] >= per_genre: # si ya tiene suficientes clips
                 continue
 
-            pm = pianoroll_to_pretty_midi(
+            pm = pianoroll_to_pretty_midi( # convierte a objeto MIDI
                 Xb_np[i], fs=fs_pr, program=program, velocity=velocity, min_dur_frames=min_dur_frames
             )
-            # --- INICIO DE LA CORRECCIÓN CLAVE ---
             # Si el MIDI no tiene notas, es un clip silencioso y lo ignoramos.
-            # Esto evita crear WAVs vacíos que hacen fallar a VGGish.
+            # Esto evita crear WAVs vacíos.
             # Filtramos clips silenciosos O con muy pocas notas
-            num_notes = len(pm.instruments[0].notes)
-            if num_notes < min_notes_threshold:
-                # logging.debug(f"Clip con {num_notes} notas (<{min_notes_threshold}). Saltando...")
+            num_notes = len(pm.instruments[0].notes) 
+            if num_notes < min_notes_threshold: # descarta si hay pocas
                 continue
-            # --- FIN DE LA CORRECCIÓN MEJORADA ---
-            stem = f"{mode}_g{gid}_{per_genre_count[gid]:06d}"
-            wav_path = outdir / f"{stem}.wav"
+            stem = f"{mode}_g{gid}_{per_genre_count[gid]:06d}" # nombre base del archivo
+            wav_path = outdir / f"{stem}.wav" # ruta completa del WAV
             try:
-                render_midi_to_wav(pm, wav_path, sr=CONFIG["sample_rate"])
+                render_midi_to_wav(pm, wav_path, sr=CONFIG["sample_rate"]) # renderiza a WAV
             except Exception as e:
-                logging.warning(f"No se pudo renderizar {stem}: {e}")
+                logging.warning(f"No se pudo renderizar {stem}: {e}") # log si falla
                 continue
 
-            per_genre_paths[gid].append(str(wav_path))
-            per_genre_count[gid] += 1
+            per_genre_paths[gid].append(str(wav_path)) # guarda ruta del WAV
+            per_genre_count[gid] += 1 # incrementa conteo del género
 
         # terminar si ya tenemos todo
         if all(per_genre_count[g] >= per_genre for g in CONFIG["genres"].keys()):
             break
 
-    return per_genre_paths
+    return per_genre_paths # devuelve las rutas agrupadas por género
 
 
 # ============================
@@ -424,7 +432,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     real_dir.mkdir(parents=True, exist_ok=True)
     fake_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) recolectar audios reales y generados
+    # recolectar audios reales y generados
     real_paths = collect_audio_from_loader(
         loader, cvae, gen, device, real_dir,
         per_genre=CONFIG["per_genre_eval_samples"],
@@ -449,7 +457,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
         seed=123  # para reproducibilidad en fake
     )
 
-    # 2) embeddings y FAD por género
+    # embeddings y FAD por género
     results = []
     all_real, all_fake = [], []
     for gid, name in CONFIG["genres"].items():
@@ -458,9 +466,6 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
         if len(r_list) == 0 or len(f_list) == 0:
             logging.warning(f"[T={T}] Género {gid} ({name}) sin suficientes clips.")
             continue
-
-        # r_emb = extract_vggish_embeddings(r_list, device, vgg_model)
-        # f_emb = extract_vggish_embeddings(f_list, device, vgg_model)
 
         r_emb = extract_ast_embeddings(r_list, device, ast_model, feature_extractor)
         f_emb = extract_ast_embeddings(f_list, device, ast_model, feature_extractor)
@@ -478,12 +483,10 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
         all_real.append(r_emb)
         all_fake.append(f_emb)
 
-    # Sanity: FAD real vs real (split)
+    # Sanity: FAD real vs real (split) revisamos qué tan buenas son las reconstrucciones de datos reales
     all_real_sanity = sum((real_paths[g] for g in CONFIG["genres"].keys()), [])
     mid = len(all_real_sanity)//2
     A, B = all_real_sanity[:mid], all_real_sanity[mid:mid*2]
-    # A_emb = extract_vggish_embeddings(A, device, vgg_model)
-    # B_emb = extract_vggish_embeddings(B, device, vgg_model)
     A_emb = extract_ast_embeddings(A, device, ast_model, feature_extractor)
     B_emb = extract_ast_embeddings(B, device, ast_model, feature_extractor)
     muA, sigA = gaussian_stats(A_emb)
@@ -491,7 +494,7 @@ def fad_for_checkpoint(T, device, ast_model, feature_extractor):
     fad_rr = frechet_distance(muA, sigA, muB, sigB)
     print(f"\n[Sanity] FAD(real-vs-real) = {fad_rr:.2f}\n")
 
-    # 3) FAD global (macro, juntando todos los emb)
+    # FAD global (macro, juntando todos los emb)
     if len(all_real) and len(all_fake):
         R = np.concatenate(all_real, axis=0)
         Fk = np.concatenate(all_fake, axis=0)
@@ -521,8 +524,6 @@ def main():
 
     Path(CONFIG["outdir"]).mkdir(parents=True, exist_ok=True)
 
-    # Inicializa VGGish UNA sola vez
-    # vgg = load_vggish(device, ckpt_path=CONFIG.get("vggish_ckpt"), use_postprocess=False)
     # Inicializa AST UNA sola vez
     ast_model, feature_extractor = load_ast_model(CONFIG["ast_model_id"], device)
 
@@ -530,13 +531,13 @@ def main():
     for T in CONFIG["stages_T"]:
         logging.info(f"=== Evaluando FAD para T={T} ===")
         try:
-            # rows = fad_for_checkpoint(T, device, vgg)
-            rows = fad_for_checkpoint(T, device, ast_model, feature_extractor)
+            rows = fad_for_checkpoint(T, device, ast_model, feature_extractor) # Aplicamos el FAD usando AST
             all_rows.extend(rows)
         except AssertionError as e:
             logging.warning(str(e))
             continue
-
+        
+    # Guardamos 
     if all_rows:
         df = pd.DataFrame(all_rows).sort_values(["T", "genre_id"])
         out_csv = CONFIG["results_csv"]
