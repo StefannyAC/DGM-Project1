@@ -23,7 +23,7 @@ import torch.nn.functional as F # Para funciones de activación y pérdidas
 # ------------ Event Encoder ------------
 class EventEncoder(nn.Module):
     """
-    Función para codificar una secuencia (pitch, velocity, duration) de eventos de dimensión 'in_dim'
+    Función para codificar una secuencia (timestamp, pitch, velocity) de eventos de dimensión 'in_dim'
     en un vector fijo de tamaño 'ev_embed', ignorando filas de padding compuestas solo por ceros.
 
     La codificación se realiza aplicando un MLP por evento (proyección por fila) y luego
@@ -57,7 +57,7 @@ class EventEncoder(nn.Module):
             events: (B, N, 3) con posibles filas de ceros (padding). También acepta (N,3) y lo expande a (1,N,3).
             -  B: tamaño de batch
             -  N: número máximo de eventos en la secuencia
-            -  3: características por evento (pitch, velocity, duration)
+            -  3: características por evento (timestamp, pitch, velocity)
         Returns:
             torch.Tensor: Tensor de forma '(B, ev_embed)' con la representación por secuencia
         """
