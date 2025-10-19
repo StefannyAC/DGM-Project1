@@ -14,3 +14,6 @@ eval_mse_results/
 eval_fad_cvae.py
 eval_elbo_results/
 eval_mse_cvae.py
+train.py
+eval_fad_samples_cvae.py
+eval_fad.py
